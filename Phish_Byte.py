@@ -221,7 +221,7 @@ def spf_validation_check(mail):
     return "likely spoofed"
 
 # Main Program Execution
-print("Hello user, welcome to DarkMail, a tool designed to analyze input mail scripts.")
+print("Hello user, welcome to Phish_Byte, a tool designed to analyze input mail scripts.")
 print("And generate a report on whether it is spam or not.")
 print("Please enter the mail script, the original message of the email you want to analyze.")
 print("When you're done, press Ctrl+Z (Windows) to finish entering the email.")
