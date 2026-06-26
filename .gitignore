@@ -1,0 +1,50 @@
+# Virtual environment
+venv/
+.venv/
+env/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+
+# Model weights & checkpoints
+phishbyte/model/weights/
+*.pt
+*.pth
+*.ckpt
+
+# Training artifacts
+train/runs/
+train/logs/
+*.log
+
+# Dataset files (too large for git)
+data/
+*.csv
+*.eml
+
+# SHAP cache
+shap_cache/
+
+# OS noise
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# IDE
+.vscode/
+.idea/
+*.suo
+*.user
+
+# Build
+dist/
+build/
+*.egg-info/
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
