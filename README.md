@@ -1,21 +1,17 @@
 <div align="center">
 
-<img src="https://readme-typing-svg.demolab.com?font=JetBrains+Mono&weight=700&size=32&pause=1000&color=00FF88&center=true&vCenter=true&width=600&lines=PHISH_BYTE+v2.0;Email+Threat+Engine;Built+from+scratch.+No+shortcuts." alt="Phish_Byte" />
+<img src="https://readme-typing-svg.demolab.com?font=JetBrains+Mono&weight=700&size=28&pause=1000&color=00FF88&center=true&vCenter=true&width=600&lines=PHISH_BYTE;Email+Phishing+Detection;PyTorch+%C2%B7+No+pretrained+LMs" alt="Phish_Byte" />
 
 <br/>
 
+![PyTorch](https://img.shields.io/badge/PyTorch-2.11+cu128-EE4C2C?style=for-the-badge&logo=pytorch&logoColor=white)
 ![Python](https://img.shields.io/badge/Python-3.11-3776AB?style=for-the-badge&logo=python&logoColor=white)
-![PyTorch](https://img.shields.io/badge/PyTorch-2.12.1-EE4C2C?style=for-the-badge&logo=pytorch&logoColor=white)
-![Status](https://img.shields.io/badge/Status-Active%20Development-00FF88?style=for-the-badge&logo=git&logoColor=black)
-![Target](https://img.shields.io/badge/Target-HuggingFace%20Hub-FFD21E?style=for-the-badge&logo=huggingface&logoColor=black)
-![PyTorch Hub](https://img.shields.io/badge/Target-PyTorch%20Hub-EE4C2C?style=for-the-badge&logo=pytorch&logoColor=white)
+![CUDA](https://img.shields.io/badge/CUDA-12.8-76B900?style=for-the-badge&logo=nvidia&logoColor=white)
 ![License](https://img.shields.io/badge/License-MIT-blueviolet?style=for-the-badge)
 
 <br/>
 
 ![GitHub stars](https://img.shields.io/github/stars/AnonymousSingh-007/Phish_Byte?style=social)
-![GitHub forks](https://img.shields.io/github/forks/AnonymousSingh-007/Phish_Byte?style=social)
-![GitHub issues](https://img.shields.io/github/issues/AnonymousSingh-007/Phish_Byte?color=red)
 ![GitHub last commit](https://img.shields.io/github/last-commit/AnonymousSingh-007/Phish_Byte?color=00FF88)
 ![GitHub repo size](https://img.shields.io/github/repo-size/AnonymousSingh-007/Phish_Byte)
 
@@ -23,210 +19,244 @@
 
 ---
 
-<div align="center">
-
-```
-██████╗ ██╗  ██╗██╗███████╗██╗  ██╗    ██████╗ ██╗   ██╗████████╗███████╗
-██╔══██╗██║  ██║██║██╔════╝██║  ██║    ██╔══██╗╚██╗ ██╔╝╚══██╔══╝██╔════╝
-██████╔╝███████║██║███████╗███████║    ██████╔╝ ╚████╔╝    ██║   █████╗  
-██╔═══╝ ██╔══██║██║╚════██║██╔══██║    ██╔══██╗  ╚██╔╝     ██║   ██╔══╝  
-██║     ██║  ██║██║███████║██║  ██║    ██████╔╝   ██║      ██║   ███████╗
-╚═╝     ╚═╝  ╚═╝╚═╝╚══════╝╚═╝  ╚═╝   ╚═════╝    ╚═╝      ╚═╝   ╚══════╝
-```
-
-> **The only email phishing detection engine on PyTorch Hub / HuggingFace built entirely from scratch.**  
-> No pretrained weights. No fine-tuning. No shortcuts. Every signal, every layer, every weight: ours.
-
-</div>
-
----
-
-## Repository stats
-
-<div align="center">
-
-[![GitHub Stats](https://github-readme-stats.vercel.app/api?username=AnonymousSingh-007&show_icons=true&theme=radical&title_color=00FF88&icon_color=00FF88&text_color=ffffff&bg_color=0d0d0d&border_color=00FF88&include_all_commits=true&count_private=true)](https://github.com/AnonymousSingh-007)
-
-[![Top Languages](https://github-readme-stats.vercel.app/api/top-langs/?username=AnonymousSingh-007&layout=compact&theme=radical&title_color=00FF88&text_color=ffffff&bg_color=0d0d0d&border_color=00FF88)](https://github.com/AnonymousSingh-007)
-
-[![GitHub Streak](https://streak-stats.demolab.com?user=AnonymousSingh-007&theme=dark&ring=00FF88&fire=00FF88&currStreakLabel=00FF88&sideLabels=00FF88&dates=ffffff&border=00FF88&background=0d0d0d)](https://github.com/AnonymousSingh-007)
-
-</div>
-
-### Code frequency
-
-![Contribution chart](https://ghchart.rshah.org/00FF88/AnonymousSingh-007)
-
----
-
-## Mission
+A PyTorch model for **email phishing detection**. Three-stage cascading inference: cheap rule scorers handle the obvious cases, a small MLP handles the uncertain ones, deep structural analysis handles the hardest. The model is randomly initialised and trained from scratch on phishing datasets — no pretrained language models.
 
 ```python
-# Phish_Byte v1 — what it was
-print("Phishing?", "Yes" if domain_mismatch else "No")   # deterministic. binary. no score.
+from phishbyte import PhishByteEngine
 
-# Phish_Byte v2 — what it's becoming
-verdict = engine.analyze(raw_email)
-# PhishVerdict(
-#   label          = "phishing",
-#   probability    = 0.94,
-#   confidence     = "high",
-#   layer_used     = 1,          # only ran what it needed to
-#   feature_weights = {          # shows every signal that fired
-#       "domain_mismatch":  1.0,
-#       "spf_fail":         1.0,
-#       "http_ratio":       0.8,
-#       "anchor_mismatch":  0.6,
-#   }
-# )
+engine  = PhishByteEngine()
+verdict = engine.analyze(raw_email_string)
+
+print(verdict.label)             # 'phishing'
+print(verdict.probability)       # 0.9412
+print(verdict.confidence)        # 'high'
+print(verdict.layer_used)        # 1 — decided at the cheap layer
+print(verdict.feature_weights)   # {'domain_mismatch': 1.0, 'spf_fail': 1.0, ...}
 ```
 
-A **cascading analysis engine** — reasons in stages, only escalates when uncertain, explains every verdict, ships as a real PyTorch model you can `torch.hub.load()`.
+---
+
+## Why a cascade, not a single classifier
+
+Most production email security systems process millions of messages per day. Running a neural network on every single one is wasteful when 80% of phishing attempts trip obvious rules (mismatched sender domain, SPF failure, suspicious TLD). Phish_Byte routes those to a fast path. The MLP only fires on the harder fraction.
+
+This means two things you can verify in the output:
+
+- **`verdict.layer_used`** tells you whether the rules alone decided, or whether the neural network had to run. Useful for cost reporting.
+- **`verdict.feature_weights`** shows exactly which signals fired. Not a black box.
+
+Thresholds between layers are not hardcoded. They're calibrated on a held-out validation set via ROC analysis — the phish gate is set to the lowest threshold that maintains ≥95% precision, the clean gate to the highest threshold that maintains ≥95% recall on legitimate emails. Run `python train/calibrate_thresholds.py` after training to regenerate them for your own dataset.
 
 ---
 
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                      EMAIL INPUT                            │
-│              .eml  /  raw headers  /  string                │
-└──────────────────────────┬──────────────────────────────────┘
-                           │
-                           ▼
-┌─────────────────────────────────────────────────────────────┐
-│  LAYER 1 — Static rule scorer            [always runs]      │
-│                                                             │
-│  ┌─────────────┐  ┌─────────────┐  ┌──────────────────┐    │
-│  │  Domain     │  │    URL      │  │  Body scorer     │    │
-│  │  scorer     │  │  scorer     │  │  (new)           │    │
-│  │  0.0 – 1.0  │  │  0.0 – 1.0  │  │  0.0 – 1.0       │    │
-│  └─────────────┘  └─────────────┘  └──────────────────┘    │
-└──────────────────────────┬──────────────────────────────────┘
-                           │
-              ┌────────────▼────────────┐
-              │   CONFIDENCE GATE 1     │
-              │   score > 0.85?         │
-              └──────┬──────────┬───────┘
-               YES   │          │  NO — escalate
-                     │          ▼
-                     │  ┌──────────────────────────────────────┐
-                     │  │  LAYER 2 — Learned MLP scorer        │
-                     │  │  15-feature vec → sigmoid → P(phish) │
-                     │  │  + SHAP explainability head          │
-                     │  └──────────────┬───────────────────────┘
-                     │                 │
-                     │    ┌────────────▼────────────┐
-                     │    │   CONFIDENCE GATE 2     │
-                     │    └──────┬──────────┬───────┘
-                     │     YES   │          │  NO — escalate
-                     │           │          ▼
-                     │           │  ┌───────────────────────────┐
-                     │           │  │  LAYER 3 — Deep scan      │
-                     │           │  │  redirect chains          │
-                     │           │  │  WHOIS domain age         │
-                     │           │  │  ASN / geo reputation     │
-                     │           │  └──────────┬────────────────┘
-                     │           │             │
-                     └───────────┴─────────────┘
-                                               │
-                                               ▼
-                    ┌──────────────────────────────────────────┐
-                    │            VERDICT OBJECT                │
-                    │  label  ·  probability  ·  confidence    │
-                    │  layer_used  ·  feature_weights          │
-                    └──────────────────────────────────────────┘
+   raw email
+       │
+       ▼
+┌──────────────────────────────────┐
+│ Layer 1 — rule scorers           │   always runs
+│   • domain consistency           │   ~1ms per email
+│   • SPF validation               │
+│   • URL / anchor analysis        │
+│   • body urgency + obfuscation   │
+└──────────────┬───────────────────┘
+               │
+       calibrated gate
+               │
+        uncertain ─► ┌──────────────────────────────────┐
+                     │ Layer 2 — MLP                    │   only when uncertain
+                     │   15-d feature vector            │   ~5ms per email on GPU
+                     │   2 hidden layers, sigmoid       │   trained from scratch
+                     │   + post-hoc SHAP attribution    │
+                     └──────────────┬───────────────────┘
+                                    │
+                            calibrated gate
+                                    │
+                             uncertain ─► ┌──────────────────────────────────┐
+                                          │ Layer 3 — deep structural        │   rare path
+                                          │   • redirect chain depth         │   network calls
+                                          │   • WHOIS domain age             │   ~200ms+
+                                          │   • ASN / geo reputation         │
+                                          └──────────────────────────────────┘
+                                    │
+                                    ▼
+                              PhishVerdict
 ```
 
 ---
 
-## Feature signals
-
-| Signal | Layer | Type | Source |
-|--------|-------|------|--------|
-| Domain consistency — From / Reply-To / Return-Path | 1 | rule | Original Phish_Byte |
-| SPF validation — DNS + IP range check | 1 | rule | Original Phish_Byte |
-| HTTPS ratio in email body | 1 | rule | Original Phish_Byte |
-| Anchor text ↔ href domain mismatch | 1 | rule | Original Phish_Byte |
-| Urgency keyword density | 1 | rule | **New** |
-| Link-to-text ratio | 1 | rule | **New** |
-| HTML obfuscation score | 1 | rule | **New** |
-| Learned phishing probability | 2 | MLP | **New — trained from scratch** |
-| SHAP per-feature attribution | 2 | explainability | **New** |
-| Redirect hop count + domain switches | 3 | deep | **New** |
-| WHOIS domain registration age | 3 | deep | **New** |
-| ASN / geolocation reputation | 3 | deep | **New** |
-
----
-
-## Quickstart
+## Install
 
 ```bash
 git clone https://github.com/AnonymousSingh-007/Phish_Byte.git
 cd Phish_Byte
 
 py -3.11 -m venv venv
-.\venv\Scripts\Activate.ps1        # Windows
-# source venv/bin/activate          # Linux / Mac
+.\venv\Scripts\Activate.ps1                                            # Windows
+# source venv/bin/activate                                              # Linux / Mac
 
 pip install -r requirements.txt
+
+# GPU users: install CUDA-enabled PyTorch (RTX 50 series / Blackwell)
+pip install torch --index-url https://download.pytorch.org/whl/cu128
 ```
 
+Verify GPU is detected:
+
+```bash
+python -c "import torch; print(torch.cuda.is_available(), torch.cuda.get_device_name(0))"
+# Expected: True NVIDIA GeForce RTX 5050 Laptop GPU
+```
+
+---
+
+## Usage
+
+### CLI
+
+```bash
+python cli.py --demo                       # built-in phishing sample
+python cli.py --file suspicious.eml        # analyse a .eml file
+python cli.py                              # paste raw email, Ctrl+Z to submit
+python cli.py --demo --json                # JSON output for scripting
+```
+
+### Python API
+
 ```python
-from phishbyte.engine import PhishByteEngine
+from phishbyte import PhishByteEngine
 
 engine = PhishByteEngine()
 
-with open("suspicious.eml", "r") as f:
-    raw = f.read()
+# Load a raw email (with headers)
+with open("suspicious.eml") as f:
+    verdict = engine.analyze(f.read())
 
-verdict = engine.analyze(raw)
-print(verdict)
-# PhishVerdict(label='phishing', probability=0.94, confidence='high', layer_used=1, ...)
+if verdict.label == "phishing" and verdict.confidence == "high":
+    quarantine(email)
+```
+
+### Output schema
+
+```python
+PhishVerdict(
+    label           = "phishing",        # "phishing" | "legitimate"
+    probability     = 0.94,              # P(phish) in [0, 1]
+    confidence      = "high",            # "high" | "medium" | "low"
+    layer_used      = 1,                 # 1 | 2 | 3 — which layer decided
+    feature_weights = {                  # which signals fired
+        "domain_mismatch":  1.0,
+        "spf_fail":         1.0,
+        "http_ratio":       0.8,
+    },
+    detail          = "...",             # human-readable summary
+)
 ```
 
 ---
 
-## Build status
+## Training your own
 
-| Milestone | Status |
-|-----------|--------|
-| Original rule-based analyser (v1) | ✅ Done |
-| Repo restructure + venv | ✅ Done |
-| Layer 1 — extractor refactor (scored dicts) | 🔨 In progress |
-| Verdict dataclass | ⬜ Next |
-| Engine skeleton + confidence gates | ⬜ Planned |
-| Layer 2 — MLP training on CEAS-2008 | ⬜ Planned |
-| SHAP explainability head | ⬜ Planned |
-| Layer 3 — deep structural checks | ⬜ Planned |
-| PyTorch Hub publish | ⬜ Planned |
-| HuggingFace Hub publish | ⬜ Planned |
-| Browser extension wrapper | ⬜ Planned |
+```bash
+# 1. Train the MLP
+python train/train.py
 
----
+# 2. Calibrate confidence thresholds on the validation set
+python train/calibrate_thresholds.py
 
-## Dataset
+# 3. Verify the engine loads everything
+python cli.py --demo
+```
 
-Training uses **CEAS-2008** (~39K labelled emails, public) and the **Enron spam corpus**.  
-Neither is included in the repo — see `train/README.md` for download links and preprocessing steps.
+The default `train.py` runs on synthetic data to prove the pipeline. For real performance, point it at a labelled CSV:
+
+```bash
+python train/train.py --data data/ceas2008.csv
+```
+
+CSV format: two columns, `email_text` (full raw email including headers) and `label` (`0` legitimate, `1` phishing). CEAS-2008 and the Enron spam corpus are not included in the repo — see `train/README.md` for download instructions.
 
 ---
 
-## Research context
+## Benchmarks
 
-Phish_Byte is a companion artifact to ongoing research in adversarial analysis of AI-driven systems. The cascading engine architecture — deterministic rule signals feeding a learned scorer with staged escalation and full explainability — is the contribution, not just the weights.
+Pending real-dataset evaluation on CEAS-2008. The table below will be populated once training completes:
 
-Target venues: **IEEE TIFS** · **IEEE S&P**
+| Metric | Synthetic | CEAS-2008 |
+|--------|-----------|-----------|
+| Accuracy | TBD | TBD |
+| Precision (phish) | TBD | TBD |
+| Recall (phish) | TBD | TBD |
+| F1 score | TBD | TBD |
+| ROC-AUC | TBD | TBD |
+| Layer 1 coverage | TBD | TBD |
+| Avg inference latency | TBD | TBD |
+| Throughput (emails/sec) | TBD | TBD |
+
+Layer 1 coverage is the percentage of emails decided without invoking the MLP. Higher is better — it means less compute spent per email at deployment.
+
+---
+
+## What this is not
+
+- **Not a language model.** No transformer, no embedding lookup, no pretrained weights of any kind. The MLP at Layer 2 is randomly initialised and trained from scratch on the 15-dimensional feature vector produced by Layer 1.
+- **Not a spam filter.** Spam and phishing overlap but are distinct problems. Phish_Byte targets credential theft, account compromise, and impersonation attacks.
+- **Not infallible.** Confidence is calibrated on a validation set, but novel attack patterns and adversarial emails crafted to game these specific features will get through. Use it as one signal in a defence-in-depth stack, not as the only gate.
+
+---
+
+## Repo layout
+
+```
+Phish_Byte/
+├── phishbyte/
+│   ├── engine.py            # cascading engine, threshold gates
+│   ├── verdict.py           # PhishVerdict dataclass
+│   ├── calibration.py       # ROC-based threshold learning
+│   ├── extractors/          # Layer 1 rule scorers
+│   │   ├── domain.py
+│   │   ├── urls.py
+│   │   └── spf.py
+│   └── model/
+│       ├── mlp.py           # Layer 2 PyTorch MLP
+│       └── weights/         # trained weights + thresholds.json
+├── train/
+│   ├── train.py             # MLP training loop
+│   ├── calibrate_thresholds.py
+│   └── synthetic_data.py    # synthetic emails for pipeline testing
+├── cli.py                   # command-line interface
+└── requirements.txt
+```
+
+---
+
+## Roadmap
+
+- [x] Layer 1 rule scorers
+- [x] PyTorch MLP at Layer 2
+- [x] ROC-based threshold calibration
+- [x] Verdict object with per-feature attribution
+- [x] GPU support (CUDA 12.8 / Blackwell)
+- [ ] CEAS-2008 training + benchmark table
+- [ ] Temperature-scaled calibrated probabilities
+- [ ] Layer 3 deep structural checks (with retry / timeout / fallback)
+- [ ] Feature vector caching (skip re-extraction across training runs)
+- [ ] PyTorch Hub publish
+- [ ] HuggingFace Hub publish (`PyTorchModelHubMixin`)
+- [ ] Browser extension wrapper
+
+---
+
+## License
+
+MIT — see [`LICENSE`](LICENSE).
 
 ---
 
 <div align="center">
 
 ![Visitor Count](https://komarev.com/ghpvc/?username=AnonymousSingh-007&label=PROFILE+VIEWS&color=00FF88&style=for-the-badge)
-
-```
-Built from scratch. No pretrained weights. No shortcuts.
-Phish_Byte v2 — AnonymousSingh-007
-```
 
 </div>
