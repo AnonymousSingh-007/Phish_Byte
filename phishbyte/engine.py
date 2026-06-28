@@ -1,12 +1,18 @@
 """
-phishbyte/engine.py
-PhishByte cascading analysis engine — v3.
+phishbyte/engine.py — v4
 
-Changes from v2
-───────────────
-  • Added subject scorer to Layer 1 (4 extractors now)
-  • Brand impersonation rolled into domain score
-  • Composite L1 score reweighted across 4 modules
+CRITICAL FIX from v3:
+  Layer 1 only handles EXTREME high-confidence cases.
+  Everything else routes to the MLP, which has the real decision boundary.
+  Previous v3 was short-circuiting at Layer 1 with low scores, bypassing
+  the MLP entirely. The MLP achieves Youden J = 0.656 on the val set —
+  we need it to actually run.
+
+New behaviour:
+  - Layer 1 phish gate raised to 0.85 (very confident "obvious phishing")
+  - Layer 1 clean gate kept low at 0.05 (very confident "nothing suspicious")
+  - Almost everything routes to MLP, which is what should be making decisions
+  - --force-mlp flag bypasses Layer 1 entirely for debugging
 """
 
 import os
@@ -22,10 +28,11 @@ from phishbyte.verdict            import PhishVerdict
 from phishbyte.calibration        import load_thresholds
 
 
-FALLBACK_L1_PHISH = 0.75
-FALLBACK_L1_CLEAN = 0.25
-FALLBACK_L2_PHISH = 0.80
-FALLBACK_L2_CLEAN = 0.20
+# v4 defaults — Layer 1 only handles extreme cases now
+FALLBACK_L1_PHISH = 0.85    # was 0.75 — only veto on very obvious phishing
+FALLBACK_L1_CLEAN = 0.05    # was 0.25 — only veto on very obvious legit
+FALLBACK_L2_PHISH = 0.70    # MLP threshold — set per calibration
+FALLBACK_L2_CLEAN = 0.30
 
 _WEIGHTS_DIR        = os.path.join(os.path.dirname(__file__), "model", "weights")
 DEFAULT_WEIGHTS     = os.path.join(_WEIGHTS_DIR, "phishbyte_mlp.pt")
@@ -34,25 +41,18 @@ DEFAULT_THRESHOLDS  = os.path.join(_WEIGHTS_DIR, "thresholds.json")
 
 class PhishByteEngine:
     """
-    Cascading phishing analysis engine.
+    v4 cascade — MLP-centric routing.
 
-    Four Layer 1 scorers feed both the gate logic and the Layer 2 MLP:
-      • domain  — From/Reply-To/Return-Path consistency + brand impersonation
-      • url     — HTTPS ratio, anchor mismatches, suspicious TLDs, urgency
-      • spf     — DNS-based SPF validation (skipped on historical training data)
-      • subject — urgency, security theme, brand names, fake transaction IDs
-
-    Layer 2 MLP only runs when Layer 1 is uncertain.
-    Thresholds calibrated from validation ROC analysis.
+    Layer 1 acts as a fast veto only — handles extreme cases (P > 0.85 obvious
+    phishing, P < 0.05 obvious legitimate). Everything else (the uncertain
+    middle, which is most real email) gets routed to the trained MLP, which
+    has learned the actual decision boundary.
     """
 
-    def __init__(
-        self,
-        weights_path:    Optional[str] = None,
-        thresholds_path: Optional[str] = None,
-    ):
+    def __init__(self, weights_path=None, thresholds_path=None, force_mlp=False):
         self.model: Optional[PhishByteMLPLayer] = None
         self._model_loaded = False
+        self.force_mlp = force_mlp
 
         wpath = weights_path or DEFAULT_WEIGHTS
         if os.path.exists(wpath):
@@ -70,23 +70,26 @@ class PhishByteEngine:
                 self.l2_clean = cfg.get("layer2", cfg["layer1"]).clean_threshold
                 self._calibrated = True
                 print(
-                    f"[PhishByte] Thresholds loaded — "
-                    f"L1: phish≥{self.l1_phish:.3f} clean≤{self.l1_clean:.3f}  "
-                    f"L2: phish≥{self.l2_phish:.3f} clean≤{self.l2_clean:.3f}"
+                    f"[PhishByte] Thresholds — "
+                    f"L1: ≥{self.l1_phish:.3f}/≤{self.l1_clean:.3f}  "
+                    f"L2: ≥{self.l2_phish:.3f}/≤{self.l2_clean:.3f}"
                 )
             except Exception as e:
                 print(f"[PhishByte] Threshold load failed: {e}. Fallback values.")
                 self._use_fallback_thresholds()
         else:
-            print(f"[PhishByte] No calibrated thresholds. Using fallback.")
+            print(f"[PhishByte] Using fallback thresholds.")
             self._use_fallback_thresholds()
+
+        if self.force_mlp:
+            print(f"[PhishByte] FORCE-MLP mode: bypassing Layer 1 routing.")
 
     def _use_fallback_thresholds(self):
         self.l1_phish, self.l1_clean = FALLBACK_L1_PHISH, FALLBACK_L1_CLEAN
         self.l2_phish, self.l2_clean = FALLBACK_L2_PHISH, FALLBACK_L2_CLEAN
         self._calibrated = False
 
-    def _load_model(self, path: str):
+    def _load_model(self, path):
         try:
             self.model = PhishByteMLPLayer()
             state = torch.load(path, map_location="cpu", weights_only=True)
@@ -95,65 +98,55 @@ class PhishByteEngine:
             self._model_loaded = True
             print(f"[PhishByte] MLP loaded from {path}")
         except Exception as e:
-            print(f"[PhishByte] Failed to load weights: {e}. Layer 1 only.")
+            print(f"[PhishByte] Failed to load weights: {e}.")
             self.model = None
             self._model_loaded = False
 
     def analyze(self, raw_email: str) -> PhishVerdict:
-        domain_result  = score_domain(raw_email)
-        url_result     = score_urls(raw_email)
-        spf_result     = score_spf(raw_email)
-        subject_result = score_subject(raw_email)
+        d   = score_domain(raw_email)
+        u   = score_urls(raw_email)
+        s   = score_spf(raw_email)
+        sub = score_subject(raw_email)
 
-        l1_score = self._layer1_composite(
-            domain_result, url_result, spf_result, subject_result
-        )
-        feature_weights = self._build_feature_weights(
-            domain_result, url_result, spf_result, subject_result
-        )
+        l1_score = self._layer1_composite(d, u, s, sub)
+        feature_weights = self._build_feature_weights(d, u, s, sub)
 
-        if l1_score >= self.l1_phish:
-            return PhishVerdict(
-                label="phishing", probability=round(l1_score, 4),
-                confidence="high", layer_used=1,
-                feature_weights=feature_weights,
-                detail=self._l1_detail(domain_result, url_result, spf_result, subject_result),
-            )
+        # Layer 1 acts as VETO only — extreme cases short-circuit
+        if not self.force_mlp:
+            if l1_score >= self.l1_phish:
+                return PhishVerdict(
+                    label="phishing", probability=round(l1_score, 4),
+                    confidence="high", layer_used=1,
+                    feature_weights=feature_weights,
+                    detail=self._l1_detail(d, u, s, sub),
+                )
+            if l1_score <= self.l1_clean:
+                return PhishVerdict(
+                    label="legitimate", probability=round(l1_score, 4),
+                    confidence="high", layer_used=1,
+                    feature_weights=feature_weights,
+                    detail="No suspicious signals detected at Layer 1.",
+                )
 
-        if l1_score <= self.l1_clean:
-            return PhishVerdict(
-                label="legitimate", probability=round(l1_score, 4),
-                confidence="high", layer_used=1,
-                feature_weights=feature_weights,
-                detail="All Layer 1 signals within safe thresholds.",
-            )
-
+        # Default path: MLP decides
         if self._model_loaded and self.model is not None:
-            fvec    = build_feature_vector(domain_result, url_result, spf_result, subject_result)
+            fvec    = build_feature_vector(d, u, s, sub)
             l2_prob = self.model.predict_proba(fvec)
-            attribution = self._posthoc_attribution(fvec)
-            feature_weights.update(attribution)
+            feature_weights.update(self._posthoc_attribution(fvec))
 
-            if l2_prob >= self.l2_phish:
-                return PhishVerdict(
-                    label="phishing", probability=round(l2_prob, 4),
-                    confidence="high", layer_used=2,
-                    feature_weights=feature_weights,
-                    detail=f"MLP confidence: {l2_prob:.2%}. Layer 1 was uncertain at {l1_score:.2%}.",
-                )
-            if l2_prob <= self.l2_clean:
-                return PhishVerdict(
-                    label="legitimate", probability=round(l2_prob, 4),
-                    confidence="high", layer_used=2,
-                    feature_weights=feature_weights,
-                    detail=f"MLP confidence: {(1-l2_prob):.2%} legitimate.",
-                )
+            label = "phishing" if l2_prob >= 0.5 else "legitimate"
+            if l2_prob >= self.l2_phish or l2_prob <= self.l2_clean:
+                confidence = "high"
+            elif 0.35 <= l2_prob <= 0.65:
+                confidence = "low"
+            else:
+                confidence = "medium"
+
             return PhishVerdict(
-                label="phishing" if l2_prob > 0.5 else "legitimate",
-                probability=round(l2_prob, 4),
-                confidence="low", layer_used=2,
+                label=label, probability=round(l2_prob, 4),
+                confidence=confidence, layer_used=2,
                 feature_weights=feature_weights,
-                detail=f"Layer 2 uncertain at {l2_prob:.2%}. Layer 3 not implemented.",
+                detail=f"MLP probability: {l2_prob:.2%}. Layer 1 score: {l1_score:.2%}.",
             )
 
         return PhishVerdict(
@@ -161,25 +154,20 @@ class PhishByteEngine:
             probability=round(l1_score, 4),
             confidence="medium", layer_used=1,
             feature_weights=feature_weights,
-            detail=f"Layer 1 uncertain ({l1_score:.2%}). Train MLP for Layer 2.",
+            detail=f"No MLP available. Layer 1 only ({l1_score:.2%}).",
         )
 
     @staticmethod
-    def _layer1_composite(d, u, s, sub) -> float:
+    def _layer1_composite(d, u, s, sub):
         return min(1.0,
-            d["score"]   * 0.30 +
-            u["score"]   * 0.30 +
-            sub["score"] * 0.25 +
-            s["score"]   * 0.15
+            d["score"]*0.30 + u["score"]*0.30 + sub["score"]*0.25 + s["score"]*0.15
         )
 
     @staticmethod
-    def _build_feature_weights(d, u, s, sub) -> Dict[str, float]:
+    def _build_feature_weights(d, u, s, sub):
         w = {}
-        w.update(d["features"])
-        w.update(u["features"])
-        w.update(s["features"])
-        w.update(sub["features"])
+        w.update(d["features"]); w.update(u["features"])
+        w.update(s["features"]); w.update(sub["features"])
         w["domain_layer_score"]  = d["score"]
         w["url_layer_score"]     = u["score"]
         w["spf_layer_score"]     = s["score"]
@@ -187,14 +175,14 @@ class PhishByteEngine:
         return w
 
     @staticmethod
-    def _posthoc_attribution(fvec: torch.Tensor) -> Dict[str, float]:
+    def _posthoc_attribution(fvec):
         return {
             f"attribution_{name}": round(float(fvec[i]), 4)
             for i, name in enumerate(FEATURE_NAMES)
         }
 
     @staticmethod
-    def _l1_detail(d, u, s, sub) -> str:
+    def _l1_detail(d, u, s, sub):
         fired = []
         if d["features"]["domain_mismatch"] > 0:        fired.append("domain mismatch")
         if d["features"]["replyto_differs"] > 0:        fired.append("Reply-To differs")
@@ -204,6 +192,5 @@ class PhishByteEngine:
         if u["features"]["urgency_score"] > 0.3:        fired.append("body urgency")
         if u["features"]["http_ratio"] > 0.5:           fired.append("high HTTP ratio")
         if sub["features"]["subject_urgency"] > 0.3:    fired.append("subject urgency")
-        if sub["features"]["subject_security"] > 0.3:   fired.append("subject security theme")
         if sub["features"]["subject_brand_name"] > 0:   fired.append("brand in subject")
         return "Signals fired: " + (", ".join(fired) if fired else "composite threshold")
