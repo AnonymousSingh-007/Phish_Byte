@@ -1,9 +1,11 @@
 """
 phishbyte/model/mlp.py
-Layer 2 — PhishByte MLP classifier.
-Fully custom PyTorch architecture. No pretrained weights.
-Input: 15-dimensional feature vector from Layer 1 extractors.
-Output: P(phish) scalar in [0, 1].
+Layer 2 — PhishByte MLP classifier (v2).
+
+Changes from v1
+───────────────
+  • Input dim: 15 → 23 (added 5 subject features + 1 brand impersonation + 1 subject layer score + 1 reserved)
+  • Hidden: 64 → 96 (wider for richer feature set)
 """
 
 import torch
@@ -11,34 +13,40 @@ import torch.nn as nn
 from typing import Dict, List
 
 
-# ── Feature vector schema ────────────────────────────────────────────────────
-# These are the 15 features in exact order the MLP expects.
-# Any change here must be mirrored in engine.py build_feature_vector().
 FEATURE_NAMES: List[str] = [
-    # Domain features (4)
+    # Domain (5)
     "domain_mismatch",
     "replyto_differs",
     "returnpath_differs",
     "from_is_freemail",
-    # URL features (5)
+    "brand_impersonation",
+    # URL (5)
     "http_ratio",
     "anchor_mismatch_score",
     "suspicious_tld_score",
     "urgency_score",
     "link_density_score",
-    # SPF features (3)
+    # SPF (3)
     "spf_fail",
     "no_spf_record",
     "no_sending_ip",
-    # Composite Layer 1 scores (3)
+    # Subject (7)
+    "subject_urgency",
+    "subject_security",
+    "subject_brand_name",
+    "subject_currency",
+    "subject_all_caps",
+    "subject_fake_re",
+    "subject_fake_txn_id",
+    # Composite layer scores (4)
     "domain_layer_score",
     "url_layer_score",
     "spf_layer_score",
+    "subject_layer_score",
 ]
 
-INPUT_DIM  = len(FEATURE_NAMES)   # 15
-HIDDEN_DIM = 64
-OUTPUT_DIM = 1
+INPUT_DIM  = len(FEATURE_NAMES)   # 24
+HIDDEN_DIM = 96
 
 
 class PhishByteMLPLayer(nn.Module):
@@ -47,11 +55,9 @@ class PhishByteMLPLayer(nn.Module):
 
     Architecture
     ────────────
-    Input (15)
-        → Linear(15 → 64) → BatchNorm → ReLU → Dropout(0.3)
-        → Linear(64 → 32) → BatchNorm → ReLU → Dropout(0.2)
-        → Linear(32 → 1)  → Sigmoid
-    Output: P(phish) in [0, 1]
+    Input (24) → Linear → BatchNorm → ReLU → Dropout(0.3)
+              → Linear → BatchNorm → ReLU → Dropout(0.2)
+              → Linear → Sigmoid → P(phish)
     """
 
     def __init__(
@@ -62,31 +68,24 @@ class PhishByteMLPLayer(nn.Module):
         dropout2:   float = 0.2,
     ):
         super().__init__()
-
         self.feature_names = FEATURE_NAMES
-
         self.net = nn.Sequential(
-            # Block 1
             nn.Linear(input_dim, hidden_dim),
             nn.BatchNorm1d(hidden_dim),
             nn.ReLU(),
             nn.Dropout(dropout1),
 
-            # Block 2
             nn.Linear(hidden_dim, hidden_dim // 2),
             nn.BatchNorm1d(hidden_dim // 2),
             nn.ReLU(),
             nn.Dropout(dropout2),
 
-            # Output head
-            nn.Linear(hidden_dim // 2, OUTPUT_DIM),
+            nn.Linear(hidden_dim // 2, 1),
             nn.Sigmoid(),
         )
-
         self._init_weights()
 
     def _init_weights(self):
-        """Kaiming init for ReLU layers, Xavier for output."""
         for module in self.modules():
             if isinstance(module, nn.Linear):
                 nn.init.kaiming_normal_(module.weight, nonlinearity="relu")
@@ -94,29 +93,19 @@ class PhishByteMLPLayer(nn.Module):
                     nn.init.zeros_(module.bias)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Parameters
-        ----------
-        x : torch.Tensor  shape (batch_size, 15)
-
-        Returns
-        -------
-        torch.Tensor  shape (batch_size, 1)  — P(phish) per sample
-        """
         return self.net(x)
 
     def predict_proba(self, x: torch.Tensor) -> float:
-        """Single-sample inference. Returns P(phish) as a Python float."""
         self.eval()
         with torch.no_grad():
             if x.dim() == 1:
-                x = x.unsqueeze(0)            # (1, 15)
+                x = x.unsqueeze(0)
             return self.forward(x).item()
 
     def get_config(self) -> Dict:
-        """Return architecture config for HuggingFace / PyTorch Hub model card."""
         return {
             "model_type":    "PhishByteMLP",
+            "version":       "2.0",
             "input_dim":     INPUT_DIM,
             "hidden_dim":    HIDDEN_DIM,
             "feature_names": FEATURE_NAMES,
@@ -126,38 +115,27 @@ class PhishByteMLPLayer(nn.Module):
 
 
 def build_feature_vector(
-    domain_result: Dict,
-    url_result:    Dict,
-    spf_result:    Dict,
+    domain_result:  Dict,
+    url_result:     Dict,
+    spf_result:     Dict,
+    subject_result: Dict,
 ) -> torch.Tensor:
-    """
-    Assemble the 15-dimensional feature vector from Layer 1 scorer outputs.
-    Returns a float32 tensor of shape (15,).
-    """
+    """Assemble the 24-dimensional feature vector from Layer 1 outputs."""
     d = domain_result["features"]
     u = url_result["features"]
     s = spf_result["features"]
+    sub = subject_result["features"]
 
     vec = [
-        # Domain (4)
-        d["domain_mismatch"],
-        d["replyto_differs"],
-        d["returnpath_differs"],
-        d["from_is_freemail"],
-        # URL (5)
-        u["http_ratio"],
-        u["anchor_mismatch_score"],
-        u["suspicious_tld_score"],
-        u["urgency_score"],
-        u["link_density_score"],
-        # SPF (3)
-        s["spf_fail"],
-        s["no_spf_record"],
-        s["no_sending_ip"],
-        # Composite layer scores (3)
-        domain_result["score"],
-        url_result["score"],
-        spf_result["score"],
+        d["domain_mismatch"], d["replyto_differs"], d["returnpath_differs"],
+        d["from_is_freemail"], d["brand_impersonation"],
+        u["http_ratio"], u["anchor_mismatch_score"], u["suspicious_tld_score"],
+        u["urgency_score"], u["link_density_score"],
+        s["spf_fail"], s["no_spf_record"], s["no_sending_ip"],
+        sub["subject_urgency"], sub["subject_security"], sub["subject_brand_name"],
+        sub["subject_currency"], sub["subject_all_caps"], sub["subject_fake_re"],
+        sub["subject_fake_txn_id"],
+        domain_result["score"], url_result["score"], spf_result["score"],
+        subject_result["score"],
     ]
-
     return torch.tensor(vec, dtype=torch.float32)
