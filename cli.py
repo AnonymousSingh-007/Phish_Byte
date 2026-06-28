@@ -1,44 +1,30 @@
 """
-cli.py  —  PhishByte interactive command-line interface.
-Paste a raw email (headers + body), get a full verdict.
+cli.py — v2
+PhishByte interactive CLI.
+
+Changes from v1
+───────────────
+  • No more hardcoded fake demo email
+  • --demo now pulls a random real sample from data/ceas2008_phishbyte.csv
+  • --demo phish / --demo legit lets you pick the class
+  • Shows the ground truth label so you can verify the model
 
 Usage
 ─────
-    python cli.py
-    python cli.py --file suspicious.eml
-    python cli.py --demo                   # runs on a built-in phishing sample
+    python cli.py                         # paste raw email
+    python cli.py --file suspicious.eml   # analyse .eml file
+    python cli.py --demo                  # random sample from CEAS-2008
+    python cli.py --demo phish            # known phishing sample
+    python cli.py --demo legit            # known legitimate sample
+    python cli.py --demo --json           # JSON output
 """
 
-import os
-import sys
-import argparse
+import os, sys, argparse, random
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, ROOT)
 
-from phishbyte.engine import PhishByteEngine
-
-
-DEMO_EMAIL = """From: PayPal Security <security@paypa1-alert.tk>
-Reply-To: attacker@evil-domain.ru
-Return-Path: <bounce@totally-different.com>
-Received: from mail.evil-domain.ru (203.45.67.89)
-Subject: URGENT: Your account will be suspended immediately
-
-Dear Valued Customer,
-
-URGENT: Your PayPal account has been suspended due to unusual activity.
-You must verify your account immediately or it will be closed in 24 hours.
-
-Click here to verify now: http://paypal-login.tk/verify?user=victim
-Confirm your details: http://secure-paypal.ml/account/validate
-
-<a href="http://evil-phish.tk/steal">www.paypal.com</a>
-<a href="http://another-bad.ml/login">secure.paypal.com</a>
-
-Act now to avoid permanent suspension. Limited time to respond.
-Kindly confirm your banking details to restore access immediately.
-"""
+CEAS_CSV = os.path.join(ROOT, "data", "ceas2008_phishbyte.csv")
 
 BANNER = r"""
 ██████╗ ██╗  ██╗██╗███████╗██╗  ██╗    ██████╗ ██╗   ██╗████████╗███████╗
@@ -47,18 +33,43 @@ BANNER = r"""
 ██╔═══╝ ██╔══██║██║╚════██║██╔══██║    ██╔══██╗  ╚██╔╝     ██║   ██╔══╝
 ██║     ██║  ██║██║███████║██║  ██║    ██████╔╝   ██║      ██║   ███████╗
 ╚═╝     ╚═╝  ╚═╝╚═╝╚══════╝╚═╝  ╚═╝   ╚═════╝    ╚═╝      ╚═╝   ╚══════╝
-                      Email Phishing Analysis Engine v2.0
+                      Email Phishing Analysis Engine
 """
 
 
-def print_banner():
-    print(BANNER)
+def load_demo_sample(class_filter=None, seed=None):
+    """
+    Pull a random email from the CEAS-2008 CSV.
+    class_filter: 'phish' | 'legit' | None for random.
+    Returns (raw_email, true_label).
+    """
+    if not os.path.exists(CEAS_CSV):
+        print(f"  [ERROR] No CEAS-2008 data at {CEAS_CSV}")
+        print(f"  Run prepare_ceas.py first.")
+        sys.exit(1)
+
+    try:
+        import pandas as pd
+    except ImportError:
+        print(f"  [ERROR] pandas required for --demo mode.")
+        sys.exit(1)
+
+    df = pd.read_csv(CEAS_CSV).dropna()
+
+    if class_filter == "phish":
+        df = df[df["label"] == 1]
+    elif class_filter == "legit":
+        df = df[df["label"] == 0]
+
+    if seed is not None:
+        random.seed(seed)
+    row = df.sample(n=1).iloc[0]
+    return row["email_text"], int(row["label"])
 
 
 def get_email_from_stdin() -> str:
     print("┌─────────────────────────────────────────────────────┐")
     print("│  Paste your raw email below (headers + body).       │")
-    print("│  Include everything — From, Reply-To, Received...   │")
     print("│  When done: press Enter, then Ctrl+Z (Win)          │")
     print("│             or Enter, then Ctrl+D (Mac/Linux)       │")
     print("└─────────────────────────────────────────────────────┘\n")
@@ -66,37 +77,31 @@ def get_email_from_stdin() -> str:
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="PhishByte CLI — paste an email, get a verdict."
-    )
-    parser.add_argument(
-        "--file", type=str, default=None,
-        help="Path to a .eml file to analyse."
-    )
-    parser.add_argument(
-        "--demo", action="store_true",
-        help="Run on a built-in phishing sample."
-    )
-    parser.add_argument(
-        "--weights", type=str, default=None,
-        help="Path to custom model weights .pt file."
-    )
-    parser.add_argument(
-        "--json", action="store_true",
-        help="Output verdict as JSON instead of formatted display."
-    )
+    parser = argparse.ArgumentParser(description="PhishByte CLI.")
+    parser.add_argument("--file",    type=str, default=None,
+                        help="Path to a .eml file.")
+    parser.add_argument("--demo",    nargs="?", const="random",
+                        choices=["random", "phish", "legit"],
+                        help="Pull random sample from CEAS-2008.")
+    parser.add_argument("--seed",    type=int, default=None,
+                        help="Seed for --demo selection (reproducible).")
+    parser.add_argument("--weights", type=str, default=None)
+    parser.add_argument("--json",    action="store_true")
     args = parser.parse_args()
 
-    print_banner()
+    print(BANNER)
 
-    # ── Load engine ───────────────────────────────────────────────────────────
+    from phishbyte.engine import PhishByteEngine
     engine = PhishByteEngine(weights_path=args.weights)
     print()
 
-    # ── Get email input ───────────────────────────────────────────────────────
+    true_label = None
     if args.demo:
-        print("  [DEMO MODE] Running on built-in phishing sample...\n")
-        raw_email = DEMO_EMAIL
+        class_filter = None if args.demo == "random" else args.demo
+        print(f"  [DEMO] Pulling {args.demo} sample from CEAS-2008...\n")
+        raw_email, true_label = load_demo_sample(class_filter, seed=args.seed)
+        truth_text = "PHISHING" if true_label == 1 else "LEGITIMATE"
+        print(f"  Ground truth label: {truth_text}\n")
 
     elif args.file:
         if not os.path.exists(args.file):
@@ -112,17 +117,20 @@ def main():
             print("  [ERROR] No email content received.")
             sys.exit(1)
 
-    # ── Analyse ───────────────────────────────────────────────────────────────
-    print("  Analysing...\n")
+    print(f"  Analysing...\n")
     verdict = engine.analyze(raw_email)
 
-    # ── Output ────────────────────────────────────────────────────────────────
     if args.json:
         print(verdict.to_json())
     else:
         print(verdict)
 
-    # Exit code: 1 if phishing (useful for scripting/browser ext later)
+    if true_label is not None:
+        predicted = 1 if verdict.label == "phishing" else 0
+        match = "✓ CORRECT" if predicted == true_label else "✗ WRONG"
+        print(f"\n  Prediction vs truth: {match}")
+        print(f"  Predicted: {verdict.label}    Actual: {'phishing' if true_label else 'legitimate'}")
+
     sys.exit(1 if verdict.label == "phishing" else 0)
 
 
