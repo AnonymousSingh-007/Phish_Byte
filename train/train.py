@@ -1,19 +1,19 @@
 """
 train/train.py
-PhishByte MLP — end-to-end training pipeline (v2)
+PhishByte MLP — end-to-end training pipeline (v3)
 
-Changes from v1
+Changes from v2
 ───────────────
-  • Feature vector caching: extract once, reuse across runs (massive speedup)
-  • GPU detection visible at top of run
-  • Fixed PyTorch 2.11+ ReduceLROnPlateau signature (no `verbose` kwarg)
-  • Cache invalidation via --rebuild-cache flag
+  • Adds --skip-spf flag for historical datasets (sets PHISHBYTE_SKIP_SPF=1)
+  • Better CSV loading: handles 'email_text' column case-insensitively
+  • Reports label balance and split balance before training
+  • CEAS-2008 ready
 
 Usage
 ─────
-    python train/train.py                          # synthetic data, cached
-    python train/train.py --rebuild-cache          # force re-extraction
-    python train/train.py --data data/ceas.csv     # real CEAS-2008
+    python train/train.py                                        # synthetic
+    python train/train.py --data data/ceas2008_phishbyte.csv     # real
+    python train/train.py --data data/ceas2008_phishbyte.csv --skip-spf
 """
 
 import os
@@ -29,16 +29,18 @@ import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader, random_split
 
-# ── Path setup ────────────────────────────────────────────────────────────────
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
-from phishbyte.extractors.domain import score_domain
-from phishbyte.extractors.urls   import score_urls
-from phishbyte.extractors.spf    import score_spf
-from phishbyte.model.mlp         import PhishByteMLPLayer, build_feature_vector, INPUT_DIM
 
-# ── Config ────────────────────────────────────────────────────────────────────
+def _set_spf_skip(skip: bool):
+    """Must run BEFORE importing extractors — they check env at import."""
+    if skip:
+        os.environ["PHISHBYTE_SKIP_SPF"] = "1"
+    else:
+        os.environ.pop("PHISHBYTE_SKIP_SPF", None)
+
+
 WEIGHTS_DIR  = os.path.join(ROOT, "phishbyte", "model", "weights")
 WEIGHTS_PATH = os.path.join(WEIGHTS_DIR, "phishbyte_mlp.pt")
 CACHE_DIR    = os.path.join(ROOT, "train", "cache")
@@ -52,13 +54,7 @@ TEST_SPLIT   = 0.10
 PATIENCE     = 8
 
 
-# ── Feature caching ───────────────────────────────────────────────────────────
-
 def _dataset_fingerprint(samples: List[Tuple[str, int]]) -> str:
-    """
-    Produce a stable hash of the dataset so we know when to invalidate cache.
-    Hashes the first 100 chars of each email + label. Same data → same hash.
-    """
     h = hashlib.md5()
     for raw_email, label in samples:
         h.update(raw_email[:100].encode("utf-8", errors="ignore"))
@@ -66,33 +62,32 @@ def _dataset_fingerprint(samples: List[Tuple[str, int]]) -> str:
     return h.hexdigest()[:16]
 
 
-def extract_features_with_cache(
-    samples:       List[Tuple[str, int]],
-    rebuild:       bool = False,
-) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
-    """
-    Extract feature vectors for all samples, with disk caching.
-    First run: extract + save. Subsequent runs: load from cache.
-    """
+def extract_features_with_cache(samples, rebuild=False):
+    from phishbyte.extractors.domain import score_domain
+    from phishbyte.extractors.urls   import score_urls
+    from phishbyte.extractors.spf    import score_spf
+    from phishbyte.model.mlp         import build_feature_vector
+
     os.makedirs(CACHE_DIR, exist_ok=True)
     fingerprint = _dataset_fingerprint(samples)
     cache_path  = os.path.join(CACHE_DIR, f"features_{fingerprint}.pkl")
 
-    # ── Try cache first ───────────────────────────────────────────────────────
     if os.path.exists(cache_path) and not rebuild:
         print(f"  Cache HIT  → {cache_path}")
         with open(cache_path, "rb") as f:
             features, labels = pickle.load(f)
-        print(f"  Loaded {len(features)} cached vectors instantly.")
+        print(f"  Loaded {len(features):,} cached vectors instantly.")
         return features, labels
 
-    # ── Cache miss or rebuild → extract from scratch ──────────────────────────
-    print(f"  Cache MISS → extracting features for {len(samples)} emails")
-    print(f"  Note: SPF does live DNS lookups, this may take a while...")
+    print(f"  Cache MISS → extracting features for {len(samples):,} emails")
+    if os.environ.get("PHISHBYTE_SKIP_SPF") == "1":
+        print(f"  SPF: SKIPPED (training mode, no DNS)")
+    else:
+        print(f"  SPF: LIVE  (real DNS lookups — slow on dead domains)")
+
     features, labels = [], []
     t0      = time.time()
     skipped = 0
-
     for i, (raw_email, label) in enumerate(samples):
         try:
             d = score_domain(raw_email)
@@ -102,41 +97,29 @@ def extract_features_with_cache(
             labels.append(torch.tensor([float(label)], dtype=torch.float32))
         except Exception:
             skipped += 1
-
-        if (i + 1) % 100 == 0:
+        if (i + 1) % 500 == 0:
             elapsed = time.time() - t0
             rate    = (i + 1) / elapsed
             eta     = (len(samples) - (i + 1)) / rate
-            print(f"    [{i+1}/{len(samples)}]  {elapsed:>5.0f}s elapsed  "
-                  f"{rate:.1f} emails/s  ETA {eta:>5.0f}s")
+            print(f"    [{i+1:>6}/{len(samples):>6}]  "
+                  f"{elapsed:>6.0f}s elapsed  {rate:>6.1f} emails/s  "
+                  f"ETA {eta:>5.0f}s")
 
     total = time.time() - t0
-    print(f"  Done. {len(features)} valid, {skipped} skipped. ({total:.1f}s total)")
+    print(f"  Done. {len(features):,} valid, {skipped} skipped. ({total:.1f}s)")
 
-    # ── Save cache ────────────────────────────────────────────────────────────
     with open(cache_path, "wb") as f:
         pickle.dump((features, labels), f)
     print(f"  Cached → {cache_path}")
-    print(f"  Next run will be instant unless --rebuild-cache is passed.")
-
     return features, labels
 
 
-# ── Dataset wrapper ───────────────────────────────────────────────────────────
-
 class FeatureDataset(Dataset):
     def __init__(self, features, labels):
-        self.features = features
-        self.labels   = labels
+        self.features, self.labels = features, labels
+    def __len__(self): return len(self.features)
+    def __getitem__(self, idx): return self.features[idx], self.labels[idx]
 
-    def __len__(self):
-        return len(self.features)
-
-    def __getitem__(self, idx):
-        return self.features[idx], self.labels[idx]
-
-
-# ── Training / eval ───────────────────────────────────────────────────────────
 
 def train_epoch(model, loader, optimizer, criterion, device):
     model.train()
@@ -177,20 +160,21 @@ def eval_epoch(model, loader, criterion, device):
     return total_loss / total, correct / total, precision, recall, f1
 
 
-# ── Main ──────────────────────────────────────────────────────────────────────
-
 def main():
     parser = argparse.ArgumentParser(description="Train PhishByte MLP")
-    parser.add_argument("--data",          type=str,   default=None,
-                        help="Path to CSV with [email_text, label]. Blank = synthetic.")
+    parser.add_argument("--data",          type=str,   default=None)
     parser.add_argument("--epochs",        type=int,   default=EPOCHS)
     parser.add_argument("--batch-size",    type=int,   default=BATCH_SIZE)
     parser.add_argument("--lr",            type=float, default=LR)
-    parser.add_argument("--rebuild-cache", action="store_true",
-                        help="Force re-extraction of features, ignore cache.")
+    parser.add_argument("--rebuild-cache", action="store_true")
+    parser.add_argument("--skip-spf",      action="store_true",
+                        help="Bypass SPF DNS lookups (use for historical datasets).")
     args = parser.parse_args()
 
-    # ── Device detection (prominent) ──────────────────────────────────────────
+    _set_spf_skip(args.skip_spf)
+
+    from phishbyte.model.mlp import PhishByteMLPLayer, INPUT_DIM
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"\n{'═'*60}")
     print(f"  PHISH_BYTE — MLP TRAINING")
@@ -199,7 +183,7 @@ def main():
         gpu_name = torch.cuda.get_device_name(0)
         cap      = torch.cuda.get_device_capability(0)
         vram_gb  = torch.cuda.get_device_properties(0).total_memory / 1e9
-        print(f"  Device   : 🚀 GPU — {gpu_name}")
+        print(f"  Device   : GPU — {gpu_name}")
         print(f"             Compute capability {cap[0]}.{cap[1]}  ·  {vram_gb:.1f} GB VRAM")
         print(f"             PyTorch {torch.__version__}")
     else:
@@ -208,14 +192,31 @@ def main():
     print(f"  Epochs   : {args.epochs}")
     print(f"  Batch    : {args.batch_size}")
     print(f"  LR       : {args.lr}")
+    print(f"  Skip SPF : {args.skip_spf}")
 
-    # ── Load data ─────────────────────────────────────────────────────────────
     if args.data and os.path.exists(args.data):
         print(f"\n  Loading real data from {args.data}...")
         import pandas as pd
-        df      = pd.read_csv(args.data)
-        samples = list(zip(df["email_text"].tolist(), df["label"].tolist()))
-        print(f"  Loaded {len(samples)} samples.")
+        df = pd.read_csv(args.data)
+
+        cols = {c.lower(): c for c in df.columns}
+        if "email_text" not in cols:
+            print(f"  [ERROR] CSV must have 'email_text' column. Got: {list(df.columns)}")
+            sys.exit(1)
+        if "label" not in cols:
+            print(f"  [ERROR] CSV must have 'label' column. Got: {list(df.columns)}")
+            sys.exit(1)
+
+        text_col  = cols["email_text"]
+        label_col = cols["label"]
+        df = df.dropna(subset=[text_col, label_col])
+        df = df[df[text_col].str.len() > 0]
+        samples = list(zip(df[text_col].tolist(), df[label_col].astype(int).tolist()))
+        print(f"  Loaded {len(samples):,} samples.")
+        n_phish = sum(1 for _, l in samples if l == 1)
+        n_legit = len(samples) - n_phish
+        print(f"  Balance — phish: {n_phish:,}  legit: {n_legit:,}  "
+              f"({n_phish/len(samples):.1%} phish)")
     else:
         print(f"\n  Using synthetic dataset.")
         train_dir = os.path.join(ROOT, "train")
@@ -224,12 +225,10 @@ def main():
         samples = generate_dataset(n_phish=400, n_legit=400)
         print(f"  Generated {len(samples)} synthetic samples.")
 
-    # ── Feature extraction (cached) ───────────────────────────────────────────
     print(f"\n  Feature extraction pipeline:")
     features, labels = extract_features_with_cache(samples, rebuild=args.rebuild_cache)
     full_dataset = FeatureDataset(features, labels)
 
-    # ── Splits ────────────────────────────────────────────────────────────────
     n        = len(full_dataset)
     n_test   = max(1, int(n * TEST_SPLIT))
     n_val    = max(1, int(n * VAL_SPLIT))
@@ -241,9 +240,8 @@ def main():
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True)
     val_loader   = DataLoader(val_ds,   batch_size=args.batch_size)
     test_loader  = DataLoader(test_ds,  batch_size=args.batch_size)
-    print(f"\n  Split → train: {n_train}  val: {n_val}  test: {n_test}")
+    print(f"\n  Split → train: {n_train:,}  val: {n_val:,}  test: {n_test:,}")
 
-    # ── Model + optimizer ─────────────────────────────────────────────────────
     model     = PhishByteMLPLayer().to(device)
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=args.lr, weight_decay=WEIGHT_DECAY
@@ -269,13 +267,10 @@ def main():
         tr_loss, tr_acc = train_epoch(model, train_loader, optimizer, criterion, device)
         va_loss, va_acc, prec, rec, f1 = eval_epoch(model, val_loader, criterion, device)
         scheduler.step(va_loss)
-
         print(f"  {epoch:>5}  {tr_loss:>8.4f}  {tr_acc:>6.1%}  "
               f"{va_loss:>8.4f}  {va_acc:>6.1%}  {f1:>6.3f}")
-
         if va_loss < best_val_loss:
-            best_val_loss = va_loss
-            patience_ctr  = 0
+            best_val_loss, patience_ctr = va_loss, 0
             torch.save(model.state_dict(), WEIGHTS_PATH)
         else:
             patience_ctr += 1
@@ -285,13 +280,11 @@ def main():
 
     train_time = time.time() - t_train_start
 
-    # ── Final test eval ───────────────────────────────────────────────────────
     print(f"\n{'═'*60}")
     print(f"  FINAL TEST EVALUATION")
     print(f"{'═'*60}")
     model.load_state_dict(torch.load(WEIGHTS_PATH, map_location=device, weights_only=True))
     te_loss, te_acc, prec, rec, f1 = eval_epoch(model, test_loader, criterion, device)
-
     print(f"  Test Loss      : {te_loss:.4f}")
     print(f"  Test Accuracy  : {te_acc:.2%}")
     print(f"  Precision      : {prec:.4f}")
@@ -300,7 +293,7 @@ def main():
     print(f"  Train time     : {train_time:.1f}s on {device.type.upper()}")
     print(f"\n  Weights saved  → {WEIGHTS_PATH}")
     print(f"{'═'*60}\n")
-    print(f"  Next step: python train/calibrate_thresholds.py")
+    print(f"  Next step: python train/calibrate_thresholds.py --data {args.data or 'synthetic'}")
     print(f"{'═'*60}\n")
 
 
