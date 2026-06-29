@@ -1,8 +1,20 @@
-torch>=2.11.0
+# Core ML
+torch==2.11.0
 huggingface_hub>=0.24.0
-dnspython>=2.6.0
-numpy>=2.0.0
-scikit-learn>=1.5.0
-scipy>=1.13.0
-pandas>=2.2.0
-tqdm>=4.66.0
+
+# Data
+numpy==2.4.6
+pandas==3.0.3
+scipy==1.17.1
+scikit-learn==1.9.0
+
+# Feature extraction
+dnspython==2.8.0
+
+# Utilities
+tqdm==4.68.3
+
+# Optional — explainability (post-hoc SHAP attribution)
+shap==0.51.0
+numba==0.65.1
+cloudpickle==3.1.2
