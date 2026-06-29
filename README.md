@@ -4,9 +4,9 @@
 
 <br/>
 
+[![Model on HuggingFace](https://img.shields.io/badge/🤗_Model-HuggingFace_Hub-FFD21E?style=for-the-badge)](https://huggingface.co/AnonymousSingh-007/phishbyte)
 ![PyTorch](https://img.shields.io/badge/PyTorch-2.11+cu128-EE4C2C?style=for-the-badge&logo=pytorch&logoColor=white)
 ![Python](https://img.shields.io/badge/Python-3.11-3776AB?style=for-the-badge&logo=python&logoColor=white)
-![CUDA](https://img.shields.io/badge/CUDA-12.8-76B900?style=for-the-badge&logo=nvidia&logoColor=white)
 ![License](https://img.shields.io/badge/License-MIT-blueviolet?style=for-the-badge)
 
 <br/>
@@ -28,7 +28,8 @@ A PyTorch model for **email phishing detection** built from scratch on the CEAS-
 ```python
 from phishbyte import PhishByteEngine
 
-engine  = PhishByteEngine()
+# Pull from HuggingFace Hub (one line install)
+engine  = PhishByteEngine.from_pretrained("AnonymousSingh-007/phishbyte")
 verdict = engine.analyze(raw_email_string)
 
 print(verdict.label)             # 'phishing'
@@ -42,15 +43,54 @@ print(verdict.feature_weights)   # {'spf_fail': 1.0, 'special_density': 1.0, ...
 
 ## Why this exists
 
-Every phishing detection model on HuggingFace today is a fine-tuned transformer — DistilBERT, BERT, RoBERTa. They work well but are heavyweight: 65–110 million parameters, ~250 MB on disk, ~50 ms per email on GPU. For organizations processing millions of messages per day, that's expensive compute on email volume where 75% of cases are decided by simple rules.
+Every phishing detection model on HuggingFace today is a fine-tuned transformer — DistilBERT, BERT, RoBERTa. They work well but are heavyweight: 65–110 million parameters, ~250 MB on disk, ~50 ms per email on GPU. For organizations processing millions of messages per day, that's expensive compute on email volume where most cases are decided by simple rules.
 
 Phish_Byte takes a different bet. Build a small custom MLP from scratch (no pretrained weights, no transformers), feed it 29 carefully chosen features extracted by lightweight rule scorers, and route inference through a cascade so cheap signals handle the obvious cases. The result is a model 9,000× smaller than DistilBERT that performs competitively, deploys without a GPU, and explains every decision.
+
+**Phish_Byte is the first non-transformer phishing detection model on HuggingFace.**
+
+---
+
+## Quickstart
+
+### Install from HuggingFace Hub (recommended)
+
+```bash
+pip install phishbyte huggingface_hub
+```
+
+```python
+from phishbyte import PhishByteEngine
+
+engine  = PhishByteEngine.from_pretrained("AnonymousSingh-007/phishbyte")
+verdict = engine.analyze(raw_email_string)
+print(verdict)
+```
+
+### Install from source
+
+```bash
+git clone https://github.com/AnonymousSingh-007/Phish_Byte.git
+cd Phish_Byte
+
+py -3.11 -m venv venv
+.\venv\Scripts\Activate.ps1        # Windows
+# source venv/bin/activate          # Linux / Mac
+
+pip install -r requirements.txt
+```
+
+For GPU acceleration on RTX 50-series (Blackwell):
+
+```bash
+pip install torch --index-url https://download.pytorch.org/whl/cu128
+```
 
 ---
 
 ## Benchmarks
 
-Evaluated on a held-out 2,000-sample slice of CEAS-2008 (39,154 labelled emails total, 55.8% phishing). SPF disabled because dataset domains are historical and don't resolve.
+Evaluated on a held-out 2,000-sample slice of CEAS-2008 (39,154 labelled emails total, 55.8% phishing). SPF disabled for historical-dataset training; re-enables at inference time on fresh emails.
 
 | Metric | Phish_Byte | DistilBERT (fine-tuned)\* | Rule-based baseline |
 |--------|-----------:|--------------------------:|---------------------:|
@@ -126,33 +166,6 @@ Character-level features are vocabulary-agnostic — they catch Nigerian-prince 
 
 ---
 
-## Install
-
-```bash
-git clone https://github.com/AnonymousSingh-007/Phish_Byte.git
-cd Phish_Byte
-
-py -3.11 -m venv venv
-.\venv\Scripts\Activate.ps1                                            # Windows
-# source venv/bin/activate                                              # Linux / Mac
-
-pip install -r requirements.txt
-```
-
-GPU users with RTX 50-series (Blackwell):
-
-```bash
-pip install torch --index-url https://download.pytorch.org/whl/cu128
-```
-
-Verify:
-
-```bash
-python -c "import torch; print(torch.cuda.is_available(), torch.cuda.get_device_name(0))"
-```
-
----
-
 ## Usage
 
 ### Python API
@@ -160,8 +173,13 @@ python -c "import torch; print(torch.cuda.is_available(), torch.cuda.get_device_
 ```python
 from phishbyte import PhishByteEngine
 
+# Load pretrained model (from HuggingFace Hub)
+engine = PhishByteEngine.from_pretrained("AnonymousSingh-007/phishbyte")
+
+# Or load from local weights after training your own
 engine = PhishByteEngine()
 
+# Analyse a raw email (with headers)
 with open("suspicious.eml") as f:
     verdict = engine.analyze(f.read())
 
@@ -202,13 +220,14 @@ PhishVerdict(
 ## Training your own
 
 ```bash
-python train/prepare_ceas.py                                # convert Kaggle CSV → training CSV
-python train/train.py --data data/ceas2008_phishbyte.csv --skip-spf
-python train/calibrate_thresholds.py --data data/ceas2008_phishbyte.csv --n-val 2000
-python eval.py --n 2000                                     # batch evaluation
+python train/prepare_ceas.py                                              # convert Kaggle CSV → training CSV
+python train/train.py --data data/ceas2008_phishbyte.csv --skip-spf       # train MLP (~2 minutes on GPU)
+python train/calibrate_thresholds.py --data data/ceas2008_phishbyte.csv   # learn confidence gates
+python eval.py --n 2000                                                   # batch evaluation
+python push_to_hub.py --repo-id YOUR_HF_USERNAME/phishbyte                # publish to Hub
 ```
 
-First-time feature extraction takes ~30 seconds on 39K emails. Cached after that. Training on GPU completes in ~2 minutes.
+First-time feature extraction takes ~30 seconds on 39K emails. Cached after that.
 
 Dataset: [CEAS 2008 via Kaggle](https://www.kaggle.com/datasets/naserabdullahalam/phishing-email-dataset). Not included in repo — download separately.
 
@@ -219,7 +238,7 @@ Dataset: [CEAS 2008 via Kaggle](https://www.kaggle.com/datasets/naserabdullahala
 - **Not a transformer.** No BERT, no fine-tuning, no pretrained weights of any kind. The MLP is randomly initialised and trained from scratch.
 - **Not a spam filter.** Phish_Byte targets credential theft, impersonation, and account compromise — not promotional bulk mail.
 - **Not infallible.** F1 of 0.948 means ~5% of decisions are wrong. Novel attack patterns and adversarial emails crafted to game these specific features will get through. Use as one signal in defence-in-depth, not the only gate.
-- **Not a research paper.** This is a deployable model with measurable engineering trade-offs — small size, low latency, no GPU requirement, full explainability. Performance trade-off vs transformers is honest and documented.
+- **Not a research paper.** This is a deployable model with measurable engineering trade-offs — small size, low latency, no GPU requirement, full explainability.
 
 ---
 
@@ -228,7 +247,7 @@ Dataset: [CEAS 2008 via Kaggle](https://www.kaggle.com/datasets/naserabdullahala
 ```
 Phish_Byte/
 ├── phishbyte/
-│   ├── engine.py            # cascading engine, threshold gates
+│   ├── engine.py            # cascading engine, threshold gates, Hub integration
 │   ├── verdict.py           # PhishVerdict dataclass
 │   ├── calibration.py       # ROC-based threshold learning
 │   ├── extractors/
@@ -237,14 +256,15 @@ Phish_Byte/
 │   │   ├── spf.py           # SPF DNS validation (live or skipped)
 │   │   └── subject.py       # subject line patterns
 │   └── model/
-│       ├── mlp.py           # PyTorch MLP, 29 → 96 → 48 → 1
+│       ├── mlp.py           # PyTorch MLP w/ PyTorchModelHubMixin
 │       └── weights/         # trained weights + thresholds.json
 ├── train/
-│   ├── prepare_ceas.py      # Kaggle CSV → training CSV
-│   ├── train.py             # MLP training loop
+│   ├── prepare_ceas.py
+│   ├── train.py
 │   └── calibrate_thresholds.py
-├── cli.py                   # command-line interface
-├── eval.py                  # batch evaluation script
+├── cli.py                   # interactive command-line interface
+├── eval.py                  # batch evaluation
+├── push_to_hub.py           # one-command HuggingFace deployment
 └── requirements.txt
 ```
 
@@ -258,27 +278,26 @@ Phish_Byte/
 - [x] Verdict object with per-feature attribution
 - [x] GPU support (CUDA 12.8 / Blackwell)
 - [x] CEAS-2008 training + benchmark table
-- [x] CLI with real-sample demo mode
-- [x] Batch evaluation script
-- [ ] HuggingFace Hub publish (`PyTorchModelHubMixin`)
+- [x] CLI with real-sample demo mode + batch evaluation
+- [x] **HuggingFace Hub publish (`PyTorchModelHubMixin`)**
 - [ ] PyTorch Hub publish
 - [ ] Layer 3 deep structural checks (redirect chains, WHOIS, ASN)
 - [ ] Temperature-scaled calibrated probabilities
 - [ ] Browser extension wrapper
 - [ ] Multilingual phishing support
+- [ ] PyPI package release
 
 ---
 
 ## Citation
-
-If you use Phish_Byte in your work, please cite:
 
 ```bibtex
 @software{phishbyte2026,
   author  = {Singh, Samratth},
   title   = {Phish_Byte: A cascading from-scratch PyTorch model for email phishing detection},
   year    = {2026},
-  url     = {https://github.com/AnonymousSingh-007/Phish_Byte}
+  url     = {https://github.com/AnonymousSingh-007/Phish_Byte},
+  note    = {HuggingFace: https://huggingface.co/AnonymousSingh-007/phishbyte}
 }
 ```
 
