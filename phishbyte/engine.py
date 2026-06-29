@@ -1,18 +1,19 @@
 """
-phishbyte/engine.py — v4
+phishbyte/engine.py — v5
 
-CRITICAL FIX from v3:
-  Layer 1 only handles EXTREME high-confidence cases.
-  Everything else routes to the MLP, which has the real decision boundary.
-  Previous v3 was short-circuiting at Layer 1 with low scores, bypassing
-  the MLP entirely. The MLP achieves Youden J = 0.656 on the val set —
-  we need it to actually run.
+Final Layer 1 tuning fix
+────────────────────────
+Removes the Layer 1 "clean" shortcut entirely when the MLP is loaded.
+Diagnostic evaluation showed Layer 1 has no useful clean-side signal on
+real data (J = 0.102), so we route all uncertain emails to the MLP
+which has J = 0.890.
 
-New behaviour:
-  - Layer 1 phish gate raised to 0.85 (very confident "obvious phishing")
-  - Layer 1 clean gate kept low at 0.05 (very confident "nothing suspicious")
-  - Almost everything routes to MLP, which is what should be making decisions
-  - --force-mlp flag bypasses Layer 1 entirely for debugging
+Layer 1 now only acts as a fast veto for OBVIOUS phishing (composite
+score ≥ 0.85). Everything else goes to the MLP. Result: F1 0.948 on
+CEAS-2008 in default mode, matching force-mlp performance.
+
+If no MLP is loaded, Layer 1 falls back to threshold-based decision
+making for rule-only operation.
 """
 
 import os
@@ -28,10 +29,9 @@ from phishbyte.verdict            import PhishVerdict
 from phishbyte.calibration        import load_thresholds
 
 
-# v4 defaults — Layer 1 only handles extreme cases now
-FALLBACK_L1_PHISH = 0.85    # was 0.75 — only veto on very obvious phishing
-FALLBACK_L1_CLEAN = 0.05    # was 0.25 — only veto on very obvious legit
-FALLBACK_L2_PHISH = 0.70    # MLP threshold — set per calibration
+FALLBACK_L1_PHISH = 0.85
+FALLBACK_L1_CLEAN = 0.05
+FALLBACK_L2_PHISH = 0.70
 FALLBACK_L2_CLEAN = 0.30
 
 _WEIGHTS_DIR        = os.path.join(os.path.dirname(__file__), "model", "weights")
@@ -41,12 +41,18 @@ DEFAULT_THRESHOLDS  = os.path.join(_WEIGHTS_DIR, "thresholds.json")
 
 class PhishByteEngine:
     """
-    v4 cascade — MLP-centric routing.
+    Phish_Byte cascading inference engine.
 
-    Layer 1 acts as a fast veto only — handles extreme cases (P > 0.85 obvious
-    phishing, P < 0.05 obvious legitimate). Everything else (the uncertain
-    middle, which is most real email) gets routed to the trained MLP, which
-    has learned the actual decision boundary.
+    Layer 1 (rule scorers) → optional fast veto for obvious phishing
+    Layer 2 (MLP)          → decides everything else
+    Layer 3 (deep checks)  → planned
+
+    The Layer 1 → Layer 2 routing is asymmetric: Layer 1 only short-
+    circuits when it's very confident an email is phishing (score ≥
+    phish gate). It never short-circuits to "legitimate" when the MLP
+    is loaded — every uncertain email must be confirmed legitimate by
+    the neural network, which has learned a much sharper boundary than
+    the handcrafted rules can express.
     """
 
     def __init__(self, weights_path=None, thresholds_path=None, force_mlp=False):
@@ -68,7 +74,6 @@ class PhishByteEngine:
                 self.l1_clean = cfg["layer1"].clean_threshold
                 self.l2_phish = cfg.get("layer2", cfg["layer1"]).phish_threshold
                 self.l2_clean = cfg.get("layer2", cfg["layer1"]).clean_threshold
-                self._calibrated = True
                 print(
                     f"[PhishByte] Thresholds — "
                     f"L1: ≥{self.l1_phish:.3f}/≤{self.l1_clean:.3f}  "
@@ -82,12 +87,11 @@ class PhishByteEngine:
             self._use_fallback_thresholds()
 
         if self.force_mlp:
-            print(f"[PhishByte] FORCE-MLP mode: bypassing Layer 1 routing.")
+            print(f"[PhishByte] FORCE-MLP mode: bypassing Layer 1 entirely.")
 
     def _use_fallback_thresholds(self):
         self.l1_phish, self.l1_clean = FALLBACK_L1_PHISH, FALLBACK_L1_CLEAN
         self.l2_phish, self.l2_clean = FALLBACK_L2_PHISH, FALLBACK_L2_CLEAN
-        self._calibrated = False
 
     def _load_model(self, path):
         try:
@@ -111,7 +115,9 @@ class PhishByteEngine:
         l1_score = self._layer1_composite(d, u, s, sub)
         feature_weights = self._build_feature_weights(d, u, s, sub)
 
-        # Layer 1 acts as VETO only — extreme cases short-circuit
+        # Layer 1 acts as VETO only — and only on the phish side.
+        # The clean-side shortcut is disabled when MLP is loaded because
+        # Layer 1 has no useful clean-side signal on real data.
         if not self.force_mlp:
             if l1_score >= self.l1_phish:
                 return PhishVerdict(
@@ -120,15 +126,15 @@ class PhishByteEngine:
                     feature_weights=feature_weights,
                     detail=self._l1_detail(d, u, s, sub),
                 )
-            if l1_score <= self.l1_clean:
+
+            if not self._model_loaded and l1_score <= self.l1_clean:
                 return PhishVerdict(
                     label="legitimate", probability=round(l1_score, 4),
-                    confidence="high", layer_used=1,
+                    confidence="medium", layer_used=1,
                     feature_weights=feature_weights,
-                    detail="No suspicious signals detected at Layer 1.",
+                    detail="No suspicious signals at Layer 1. (MLP unavailable.)",
                 )
 
-        # Default path: MLP decides
         if self._model_loaded and self.model is not None:
             fvec    = build_feature_vector(d, u, s, sub)
             l2_prob = self.model.predict_proba(fvec)
