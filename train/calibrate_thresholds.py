@@ -1,7 +1,8 @@
 """
-train/calibrate_thresholds.py — v2
-Loads validation samples from --data CSV if available, else synthetic.
-Now uses 4-extractor pipeline.
+train/calibrate_thresholds.py — v3
+CRITICAL FIX: don't write thresholds for a layer with no signal (J < 0.3).
+Without this, Layer 1 calibration on low-signal data produces useless
+thresholds that short-circuit every email to "legitimate".
 """
 import os, sys, argparse, random
 import numpy as np, torch
@@ -9,12 +10,14 @@ import numpy as np, torch
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
+MIN_USEFUL_J = 0.3
+
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--data", type=str, default=None)
+    parser.add_argument("--data",     type=str, default=None)
     parser.add_argument("--skip-spf", action="store_true", default=True)
-    parser.add_argument("--n-val", type=int, default=2000)
+    parser.add_argument("--n-val",    type=int, default=2000)
     args = parser.parse_args()
 
     if args.skip_spf:
@@ -25,13 +28,13 @@ def main():
     from phishbyte.extractors.spf     import score_spf
     from phishbyte.extractors.subject import score_subject
     from phishbyte.model.mlp          import PhishByteMLPLayer, build_feature_vector
-    from phishbyte.calibration        import calibrate_layer, save_thresholds
+    from phishbyte.calibration        import calibrate_layer, save_thresholds, ThresholdConfig
 
     WEIGHTS = os.path.join(ROOT, "phishbyte", "model", "weights", "phishbyte_mlp.pt")
     OUTPATH = os.path.join(ROOT, "phishbyte", "model", "weights", "thresholds.json")
 
     print(f"\n{'═'*52}")
-    print(f"  PHISH_BYTE — THRESHOLD CALIBRATION (v2)")
+    print(f"  PHISH_BYTE — THRESHOLD CALIBRATION (v3)")
     print(f"{'═'*52}")
 
     if args.data and os.path.exists(args.data):
@@ -48,8 +51,7 @@ def main():
         from synthetic_data import generate_dataset
         random.seed(123)
         samples = generate_dataset(n_phish=200, n_legit=200)
-        print(f"  Source: synthetic")
-        print(f"  Validation samples: {len(samples)}")
+        print(f"  Source: synthetic ({len(samples)} samples)")
 
     if os.path.exists(WEIGHTS):
         model = PhishByteMLPLayer()
@@ -84,10 +86,30 @@ def main():
     cfg1 = calibrate_layer(l1, labels, "layer1", 0.95, 0.95)
     print(f"    phish≥{cfg1.phish_threshold:.4f}  precision={cfg1.phish_precision:.3f}")
     print(f"    clean≤{cfg1.clean_threshold:.4f}  recall  ={cfg1.clean_recall:.3f}")
-    print(f"    Youden J={cfg1.youden_j:.3f}  Coverage={cfg1.coverage:.1%}")
-    print(f"    {cfg1.notes}")
+    print(f"    Youden J={cfg1.youden_j:.3f}")
 
-    configs = {"layer1": cfg1}
+    configs = {}
+
+    if cfg1.youden_j < MIN_USEFUL_J:
+        print(f"\n  [WARN] Layer 1 Youden J={cfg1.youden_j:.3f} below useful threshold ({MIN_USEFUL_J}).")
+        print(f"         Layer 1 has insufficient signal on this dataset.")
+        print(f"         Writing SAFE FALLBACK thresholds for Layer 1 (extreme-only veto):")
+        print(f"         phish≥0.85  clean≤0.05  (will route almost everything to MLP)")
+        cfg1_safe = ThresholdConfig(
+            layer="layer1",
+            phish_threshold=0.85,
+            clean_threshold=0.05,
+            phish_precision=0.0,
+            clean_recall=0.0,
+            youden_j=cfg1.youden_j,
+            coverage=0.0,
+            notes=f"Calibration produced unusable thresholds (J={cfg1.youden_j:.3f}). "
+                  f"Using safe veto-only fallback. MLP handles routing."
+        )
+        configs["layer1"] = cfg1_safe
+    else:
+        configs["layer1"] = cfg1
+        print(f"    {cfg1.notes}")
 
     if has_model:
         l2 = np.array(l2_scores)
