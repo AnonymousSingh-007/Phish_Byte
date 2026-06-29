@@ -34,7 +34,7 @@ FEATURE_NAMES: List[str] = [
 ]
 
 INPUT_DIM  = len(FEATURE_NAMES)   # 29
-HIDDEN_DIM = 96
+HIDDEN_DIM = 128
 
 
 class PhishByteMLPLayer(
