@@ -1,24 +1,15 @@
 """
-phishbyte/engine.py — v5
+phishbyte/engine.py — v6 (Hub-aware)
 
-Final Layer 1 tuning fix
-────────────────────────
-Removes the Layer 1 "clean" shortcut entirely when the MLP is loaded.
-Diagnostic evaluation showed Layer 1 has no useful clean-side signal on
-real data (J = 0.102), so we route all uncertain emails to the MLP
-which has J = 0.890.
-
-Layer 1 now only acts as a fast veto for OBVIOUS phishing (composite
-score ≥ 0.85). Everything else goes to the MLP. Result: F1 0.948 on
-CEAS-2008 in default mode, matching force-mlp performance.
-
-If no MLP is loaded, Layer 1 falls back to threshold-based decision
-making for rule-only operation.
+Adds from_pretrained() classmethod that pulls weights + thresholds.json
+from HuggingFace Hub or a local directory.
 """
 
-import os
-import torch
-from typing import Dict, Any, Optional
+import os, json, torch
+from typing import Dict, Optional, Union
+from pathlib import Path
+
+from huggingface_hub import hf_hub_download
 
 from phishbyte.extractors.domain  import score_domain
 from phishbyte.extractors.urls    import score_urls
@@ -34,66 +25,184 @@ FALLBACK_L1_CLEAN = 0.05
 FALLBACK_L2_PHISH = 0.70
 FALLBACK_L2_CLEAN = 0.30
 
-_WEIGHTS_DIR        = os.path.join(os.path.dirname(__file__), "model", "weights")
-DEFAULT_WEIGHTS     = os.path.join(_WEIGHTS_DIR, "phishbyte_mlp.pt")
-DEFAULT_THRESHOLDS  = os.path.join(_WEIGHTS_DIR, "thresholds.json")
+_HERE              = os.path.dirname(__file__)
+DEFAULT_WEIGHTS    = os.path.join(_HERE, "model", "weights", "phishbyte_mlp.pt")
+DEFAULT_THRESHOLDS = os.path.join(_HERE, "model", "weights", "thresholds.json")
 
 
 class PhishByteEngine:
     """
     Phish_Byte cascading inference engine.
 
-    Layer 1 (rule scorers) → optional fast veto for obvious phishing
-    Layer 2 (MLP)          → decides everything else
-    Layer 3 (deep checks)  → planned
-
-    The Layer 1 → Layer 2 routing is asymmetric: Layer 1 only short-
-    circuits when it's very confident an email is phishing (score ≥
-    phish gate). It never short-circuits to "legitimate" when the MLP
-    is loaded — every uncertain email must be confirmed legitimate by
-    the neural network, which has learned a much sharper boundary than
-    the handcrafted rules can express.
+    Load methods
+    ────────────
+        engine = PhishByteEngine()                                    # use local weights
+        engine = PhishByteEngine.from_pretrained("user/phishbyte")    # pull from HF Hub
+        engine = PhishByteEngine.from_pretrained("/path/to/model_dir") # local dir
     """
 
-    def __init__(self, weights_path=None, thresholds_path=None, force_mlp=False):
-        self.model: Optional[PhishByteMLPLayer] = None
-        self._model_loaded = False
+    def __init__(
+        self,
+        model: Optional[PhishByteMLPLayer] = None,
+        thresholds: Optional[Dict] = None,
+        force_mlp: bool = False,
+        weights_path: Optional[str] = None,
+        thresholds_path: Optional[str] = None,
+    ):
+        self.model = model
+        self._model_loaded = model is not None
         self.force_mlp = force_mlp
 
-        wpath = weights_path or DEFAULT_WEIGHTS
-        if os.path.exists(wpath):
-            self._load_model(wpath)
-        else:
-            print(f"[PhishByte] No weights at {wpath}. Layer 1 only.")
+        if not self._model_loaded:
+            wpath = weights_path or DEFAULT_WEIGHTS
+            if os.path.exists(wpath):
+                self._load_local_model(wpath)
+            else:
+                print(f"[PhishByte] No weights at {wpath}. Layer 1 only.")
 
-        tpath = thresholds_path or DEFAULT_THRESHOLDS
-        if os.path.exists(tpath):
-            try:
-                cfg = load_thresholds(tpath)
-                self.l1_phish = cfg["layer1"].phish_threshold
-                self.l1_clean = cfg["layer1"].clean_threshold
-                self.l2_phish = cfg.get("layer2", cfg["layer1"]).phish_threshold
-                self.l2_clean = cfg.get("layer2", cfg["layer1"]).clean_threshold
-                print(
-                    f"[PhishByte] Thresholds — "
-                    f"L1: ≥{self.l1_phish:.3f}/≤{self.l1_clean:.3f}  "
-                    f"L2: ≥{self.l2_phish:.3f}/≤{self.l2_clean:.3f}"
-                )
-            except Exception as e:
-                print(f"[PhishByte] Threshold load failed: {e}. Fallback values.")
-                self._use_fallback_thresholds()
+        if thresholds is not None:
+            self._apply_thresholds(thresholds)
         else:
-            print(f"[PhishByte] Using fallback thresholds.")
-            self._use_fallback_thresholds()
+            tpath = thresholds_path or DEFAULT_THRESHOLDS
+            if os.path.exists(tpath):
+                try:
+                    cfg = load_thresholds(tpath)
+                    self._apply_thresholds_cfg(cfg)
+                except Exception as e:
+                    print(f"[PhishByte] Threshold load failed: {e}. Fallback values.")
+                    self._use_fallback_thresholds()
+            else:
+                self._use_fallback_thresholds()
 
         if self.force_mlp:
             print(f"[PhishByte] FORCE-MLP mode: bypassing Layer 1 entirely.")
 
+    @classmethod
+    def from_pretrained(
+        cls,
+        pretrained_model_name_or_path: Union[str, Path],
+        force_mlp: bool = False,
+        **kwargs,
+    ) -> "PhishByteEngine":
+        """
+        Load weights + thresholds.json from HuggingFace Hub or a local dir.
+        """
+        path_str = str(pretrained_model_name_or_path)
+
+        try:
+            model = PhishByteMLPLayer.from_pretrained(path_str, **kwargs)
+            model.eval()
+            print(f"[PhishByte] MLP loaded from {path_str}")
+        except Exception as e:
+            print(f"[PhishByte] MLP load failed: {e}")
+            model = None
+
+        thresholds = None
+        if os.path.isdir(path_str):
+            tpath = os.path.join(path_str, "thresholds.json")
+            if os.path.exists(tpath):
+                with open(tpath) as f:
+                    thresholds = json.load(f)
+                print(f"[PhishByte] Thresholds loaded from {tpath}")
+        else:
+            try:
+                tpath = hf_hub_download(
+                    repo_id=path_str,
+                    filename="thresholds.json",
+                    **kwargs,
+                )
+                with open(tpath) as f:
+                    thresholds = json.load(f)
+                print(f"[PhishByte] Thresholds loaded from Hub: {tpath}")
+            except Exception as e:
+                print(f"[PhishByte] No thresholds.json on Hub ({e}). Using fallback.")
+
+        return cls(model=model, thresholds=thresholds, force_mlp=force_mlp)
+
+    def save_pretrained(self, save_directory: Union[str, Path]):
+        """Save weights + thresholds.json to a local directory."""
+        save_dir = Path(save_directory)
+        save_dir.mkdir(parents=True, exist_ok=True)
+
+        if self.model is not None:
+            self.model.save_pretrained(str(save_dir))
+            print(f"[PhishByte] MLP saved → {save_dir}")
+
+        thresholds_data = {
+            "layer1": {
+                "phish_threshold": self.l1_phish,
+                "clean_threshold": self.l1_clean,
+            },
+            "layer2": {
+                "phish_threshold": self.l2_phish,
+                "clean_threshold": self.l2_clean,
+            },
+        }
+        with open(save_dir / "thresholds.json", "w") as f:
+            json.dump(thresholds_data, f, indent=2)
+        print(f"[PhishByte] Thresholds saved → {save_dir / 'thresholds.json'}")
+
+    def push_to_hub(self, repo_id: str, **kwargs):
+        """Push weights + thresholds.json to HuggingFace Hub."""
+        if self.model is None:
+            raise RuntimeError("No MLP loaded — cannot push to Hub.")
+
+        self.model.push_to_hub(repo_id, **kwargs)
+
+        from huggingface_hub import upload_file
+        import tempfile
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+            json.dump({
+                "layer1": {
+                    "phish_threshold": self.l1_phish,
+                    "clean_threshold": self.l1_clean,
+                },
+                "layer2": {
+                    "phish_threshold": self.l2_phish,
+                    "clean_threshold": self.l2_clean,
+                },
+            }, f, indent=2)
+            tmppath = f.name
+        upload_file(
+            path_or_fileobj=tmppath,
+            path_in_repo="thresholds.json",
+            repo_id=repo_id,
+            commit_message="Upload calibrated thresholds",
+            **kwargs,
+        )
+        os.unlink(tmppath)
+        print(f"[PhishByte] Pushed weights + thresholds → {repo_id}")
+
+    def _apply_thresholds_cfg(self, cfg):
+        self.l1_phish = cfg["layer1"].phish_threshold
+        self.l1_clean = cfg["layer1"].clean_threshold
+        self.l2_phish = cfg.get("layer2", cfg["layer1"]).phish_threshold
+        self.l2_clean = cfg.get("layer2", cfg["layer1"]).clean_threshold
+        print(
+            f"[PhishByte] Thresholds — "
+            f"L1: ≥{self.l1_phish:.3f}/≤{self.l1_clean:.3f}  "
+            f"L2: ≥{self.l2_phish:.3f}/≤{self.l2_clean:.3f}"
+        )
+
+    def _apply_thresholds(self, thresholds: Dict):
+        l1 = thresholds.get("layer1", {})
+        l2 = thresholds.get("layer2", l1)
+        self.l1_phish = l1.get("phish_threshold", FALLBACK_L1_PHISH)
+        self.l1_clean = l1.get("clean_threshold", FALLBACK_L1_CLEAN)
+        self.l2_phish = l2.get("phish_threshold", FALLBACK_L2_PHISH)
+        self.l2_clean = l2.get("clean_threshold", FALLBACK_L2_CLEAN)
+        print(
+            f"[PhishByte] Thresholds — "
+            f"L1: ≥{self.l1_phish:.3f}/≤{self.l1_clean:.3f}  "
+            f"L2: ≥{self.l2_phish:.3f}/≤{self.l2_clean:.3f}"
+        )
+
     def _use_fallback_thresholds(self):
         self.l1_phish, self.l1_clean = FALLBACK_L1_PHISH, FALLBACK_L1_CLEAN
         self.l2_phish, self.l2_clean = FALLBACK_L2_PHISH, FALLBACK_L2_CLEAN
+        print(f"[PhishByte] Using fallback thresholds.")
 
-    def _load_model(self, path):
+    def _load_local_model(self, path: str):
         try:
             self.model = PhishByteMLPLayer()
             state = torch.load(path, map_location="cpu", weights_only=True)
@@ -115,9 +224,6 @@ class PhishByteEngine:
         l1_score = self._layer1_composite(d, u, s, sub)
         feature_weights = self._build_feature_weights(d, u, s, sub)
 
-        # Layer 1 acts as VETO only — and only on the phish side.
-        # The clean-side shortcut is disabled when MLP is loaded because
-        # Layer 1 has no useful clean-side signal on real data.
         if not self.force_mlp:
             if l1_score >= self.l1_phish:
                 return PhishVerdict(
@@ -126,7 +232,6 @@ class PhishByteEngine:
                     feature_weights=feature_weights,
                     detail=self._l1_detail(d, u, s, sub),
                 )
-
             if not self._model_loaded and l1_score <= self.l1_clean:
                 return PhishVerdict(
                     label="legitimate", probability=round(l1_score, 4),
