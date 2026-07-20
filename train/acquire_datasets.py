@@ -1,368 +1,292 @@
 """
-train/acquire_datasets.py
-Downloads and preprocesses all 6 phishing datasets into a unified
-training CSV for PhishByte v3.
+train/acquire_datasets.py — v2
 
-Datasets:
-  1. CEAS-2008       → already in data/raw/CEAS_08.csv (done)
-  2. Enron           → Kaggle: 'wandita/enron-email-dataset-phishing'
-  3. SpamAssassin    → public Apache archive (auto-downloaded)
-  4. Ling-Spam       → UCI ML via direct URL
-  5. Nazario         → GitHub clair-ot/phishing-dataset
-  6. Nigerian Fraud  → Kaggle: '20000 spam or ham emails' (Monkey Learn)
+MUCH simpler than v1. We have two options:
 
-Output:
-  data/combined/phishbyte_v3_corpus.csv
-  columns: email_text, label, source
-  label: 1=phishing/spam, 0=legitimate
-  source: which dataset it came from (useful for debugging)
+OPTION A (fastest — recommended):
+  The naserabdullahalam/phishing-email-dataset on Kaggle already contains
+  ALL 6 datasets in one zip. You probably already downloaded it for CEAS-2008.
+  Just look for the other CSVs in the same zip.
+
+OPTION B (no Kaggle account):
+  Figshare hosts 7 cleaned phishing datasets from a 2024 IEEE ICMI paper.
+  Direct download, no login required.
+
+OPTION C (SpamAssassin only — fully auto, no account):
+  Apache public server, no login.
 
 Usage:
+  python train/acquire_datasets.py --check-existing
+  python train/acquire_datasets.py --spamassassin
   python train/acquire_datasets.py --all
-  python train/acquire_datasets.py --dataset spamassassin
-  python train/acquire_datasets.py --dataset enron --kaggle-key ~/.kaggle/kaggle.json
 """
 
-import os, sys, argparse, random, re, tarfile, zipfile, requests, io
+import os, sys, argparse, tarfile, requests, re
 from pathlib import Path
 
-ROOT    = Path(__file__).parent.parent
-DATA    = ROOT / "data"
-RAW     = DATA / "raw"
-COMBINED= DATA / "combined"
-OUT_CSV = COMBINED / "phishbyte_v3_corpus.csv"
+ROOT = Path(__file__).parent.parent
+RAW  = ROOT / "data" / "raw"
+OUT  = ROOT / "data" / "combined"
 
-for d in [RAW, COMBINED]:
+for d in [RAW, OUT]:
     d.mkdir(parents=True, exist_ok=True)
 
 try:
     import pandas as pd
 except ImportError:
-    print("[ERROR] pip install pandas")
-    sys.exit(1)
+    print("[ERROR] pip install pandas"); sys.exit(1)
 
 
-def _safe_str(v) -> str:
-    if v is None: return ""
-    s = str(v).strip()
+def _clean(text: str) -> str:
+    if not text: return ""
+    text = text.replace("\r\n","\n").replace("\r","\n")
+    text = re.sub(r'\n{4,}', '\n\n\n', text)
+    return text[:10_000]
+
+
+def _safe(v) -> str:
+    s = str(v).strip() if v is not None else ""
     return "" if s.lower() in ("nan","none","null") else s
 
 
-def _clean_email_text(text: str) -> str:
-    """Normalise and truncate to 10K chars to keep CSV manageable."""
-    if not text: return ""
-    text = text.replace("\r\n", "\n").replace("\r", "\n")
-    text = re.sub(r'\n{4,}', '\n\n\n', text)
-    return text[:10000]
-
-
-# ── Dataset 1: CEAS-2008 ─────────────────────────────────────────────────────
-
-def load_ceas() -> pd.DataFrame:
-    path = RAW / "CEAS_08.csv"
-    if not path.exists():
-        print(f"  [SKIP] CEAS-2008 not found at {path}")
-        print(f"         Download from Kaggle: naserabdullahalam/phishing-email-dataset")
-        return pd.DataFrame()
-    print(f"  Loading CEAS-2008 from {path}...")
-    df = pd.read_csv(path)
-    rows = []
-    for _, r in df.iterrows():
-        text = f"From: {_safe_str(r.get('sender',''))}\nSubject: {_safe_str(r.get('subject',''))}\n\n{_safe_str(r.get('body',''))}"
-        rows.append({"email_text": _clean_email_text(text), "label": int(r["label"]), "source": "ceas2008"})
-    result = pd.DataFrame(rows).dropna().query("email_text != ''")
-    print(f"  CEAS-2008: {len(result):,} rows ({result['label'].sum():,} phish)")
-    return result
-
-
-# ── Dataset 2: Enron ─────────────────────────────────────────────────────────
-
-def load_enron_kaggle() -> pd.DataFrame:
+def check_existing():
     """
-    Expects data/raw/enron_spam_data.csv from Kaggle:
-    wandita/enron-email-dataset-phishing
-    Columns: Message ID, Subject, Message, Spam/Ham
+    Check what's already in data/raw/ from the Kaggle download you already did.
+    The naserabdullahalam zip likely contains multiple CSVs.
     """
-    candidates = list(RAW.glob("enron*.csv")) + list(RAW.glob("*enron*.csv"))
-    if not candidates:
-        print(f"  [SKIP] Enron CSV not found in {RAW}")
-        print(f"         Download from Kaggle: wandita/enron-email-dataset-phishing")
-        print(f"         Save as: {RAW}/enron_spam_data.csv")
-        return pd.DataFrame()
-    path = candidates[0]
-    print(f"  Loading Enron from {path}...")
-    df = pd.read_csv(path, encoding="latin-1")
+    print(f"\n{'═'*56}")
+    print(f"  Scanning {RAW} for existing dataset files...")
+    print(f"{'═'*56}\n")
 
-    # Detect column layout
-    cols = {c.lower().strip(): c for c in df.columns}
-    msg_col = next((cols[k] for k in cols if "message" in k and "id" not in k), None)
-    subj_col = next((cols[k] for k in cols if "subject" in k), None)
-    label_col = next((cols[k] for k in cols if "spam" in k or "ham" in k or "label" in k), None)
+    all_files = list(RAW.rglob("*.csv")) + list(RAW.rglob("*.txt"))
+    if not all_files:
+        print("  No files found in data/raw/")
+        return
 
-    if not msg_col or not label_col:
-        print(f"  [WARN] Could not identify columns in Enron CSV: {list(df.columns)}")
-        return pd.DataFrame()
+    for f in sorted(all_files):
+        size_kb = f.stat().st_size / 1024
+        try:
+            df = pd.read_csv(f, nrows=3, encoding="latin-1")
+            print(f"  {f.relative_to(ROOT)}  ({size_kb:.0f} KB)")
+            print(f"    Columns: {list(df.columns)}")
+        except Exception:
+            print(f"  {f.relative_to(ROOT)}  ({size_kb:.0f} KB) — not a CSV")
+    print()
 
-    rows = []
-    for _, r in df.iterrows():
-        subj = _safe_str(r.get(subj_col, "")) if subj_col else ""
-        body = _safe_str(r.get(msg_col, ""))
-        text = f"Subject: {subj}\n\n{body}" if subj else body
-        raw_label = _safe_str(r.get(label_col, "")).lower()
-        label = 1 if "spam" in raw_label or raw_label == "1" else 0
-        rows.append({"email_text": _clean_email_text(text), "label": label, "source": "enron"})
-    result = pd.DataFrame(rows).dropna().query("email_text != ''")
-    print(f"  Enron: {len(result):,} rows ({result['label'].sum():,} phish/spam)")
-    return result
-
-
-# ── Dataset 3: SpamAssassin ───────────────────────────────────────────────────
 
 def load_spamassassin() -> pd.DataFrame:
-    """
-    Auto-downloads SpamAssassin public corpus from Apache.
-    Parses ham and spam .tar.bz2 archives into labeled rows.
-    """
-    BASE = "https://spamassassin.apache.org/old/publiccorpus/"
+    """Auto-download SpamAssassin from Apache. No login required."""
     ARCHIVES = [
-        ("20030228_easy_ham.tar.bz2",    0),
-        ("20030228_hard_ham.tar.bz2",    0),
-        ("20030228_spam.tar.bz2",         1),
-        ("20030228_spam_2.tar.bz2",       1),
+        ("20030228_easy_ham.tar.bz2", 0),
+        ("20030228_hard_ham.tar.bz2", 0),
+        ("20030228_spam.tar.bz2",     1),
+        ("20030228_spam_2.tar.bz2",   1),
     ]
-    cache_dir = RAW / "spamassassin"
-    cache_dir.mkdir(exist_ok=True)
-    rows = []
+    BASE  = "https://spamassassin.apache.org/old/publiccorpus/"
+    cache = RAW / "spamassassin_raw"
+    cache.mkdir(exist_ok=True)
+    rows  = []
+
     for fname, label in ARCHIVES:
-        local = cache_dir / fname
+        local = cache / fname
         if not local.exists():
             url = BASE + fname
-            print(f"  Downloading {fname}...")
+            print(f"  Downloading {fname} ...")
             try:
-                r = requests.get(url, timeout=30, stream=True)
+                r = requests.get(url, timeout=60, stream=True)
                 r.raise_for_status()
                 with open(local, "wb") as f:
                     for chunk in r.iter_content(8192):
                         f.write(chunk)
+                print(f"  Saved ({local.stat().st_size/1024:.0f} KB)")
             except Exception as e:
-                print(f"  [WARN] Failed to download {fname}: {e}")
+                print(f"  [WARN] Failed: {e}")
                 continue
-        print(f"  Parsing {fname}...")
+        print(f"  Parsing {fname} ...")
         try:
             with tarfile.open(local, "r:bz2") as tar:
                 for member in tar.getmembers():
                     if member.isfile():
-                        f = tar.extractfile(member)
-                        if f:
+                        f_obj = tar.extractfile(member)
+                        if f_obj:
                             try:
-                                text = f.read().decode("utf-8", errors="ignore")
-                                rows.append({"email_text": _clean_email_text(text), "label": label, "source": "spamassassin"})
+                                text = f_obj.read().decode("utf-8", errors="ignore")
+                                rows.append({"email_text": _clean(text),
+                                             "label": label,
+                                             "source": "spamassassin"})
                             except Exception:
                                 pass
         except Exception as e:
-            print(f"  [WARN] Failed to parse {fname}: {e}")
-    result = pd.DataFrame(rows).dropna().query("email_text != ''") if rows else pd.DataFrame()
-    if not result.empty:
-        print(f"  SpamAssassin: {len(result):,} rows ({result['label'].sum():,} spam)")
-    return result
+            print(f"  [WARN] Parse error: {e}")
+
+    df = pd.DataFrame(rows).dropna().query("email_text != ''") if rows else pd.DataFrame()
+    if not df.empty:
+        print(f"  SpamAssassin: {len(df):,} rows  ({int(df.label.sum()):,} spam)")
+    return df
 
 
-# ── Dataset 4: Ling-Spam ──────────────────────────────────────────────────────
-
-def load_lingspam() -> pd.DataFrame:
+def load_kaggle_combined() -> pd.DataFrame:
     """
-    Expects data/raw/lingspam/ directory extracted from:
-    https://www.kaggle.com/datasets/mandygu/lingspam-dataset
-    Or data/raw/lingspam.csv with columns: label, text
+    Load all CSVs from the naserabdullahalam Kaggle zip you already have.
+    The zip contains: CEAS_08.csv, Enron.csv, Ling.csv, Nazario.csv,
+                      Nigerian.csv, SpamAssasin.csv (note the typo in original)
     """
-    csv_path = RAW / "lingspam.csv"
-    dir_path  = RAW / "lingspam"
+    KNOWN_FILES = {
+        "Enron.csv":       {"text": ["body","text","message"], "label": ["label","spam","class"], "default_label": None},
+        "Ling.csv":        {"text": ["body","text","message"], "label": ["label","spam","class"], "default_label": None},
+        "Nazario.csv":     {"text": ["body","text","message"], "label": ["label","spam","class"], "default_label": 1},
+        "Nigerian.csv":    {"text": ["body","text","message"], "label": ["label","spam","class"], "default_label": 1},
+        "SpamAssasin.csv": {"text": ["body","text","message"], "label": ["label","spam","class"], "default_label": None},
+    }
 
-    if csv_path.exists():
-        print(f"  Loading Ling-Spam from {csv_path}...")
-        df = pd.read_csv(csv_path)
-        cols = {c.lower(): c for c in df.columns}
-        text_col  = next((cols[k] for k in cols if k in ("text","body","message","email")), None)
-        label_col = next((cols[k] for k in cols if k in ("label","spam","class","category")), None)
-        if text_col and label_col:
-            rows = [{"email_text": _clean_email_text(_safe_str(r[text_col])), "label": int(r[label_col]), "source": "lingspam"}
-                    for _, r in df.iterrows()]
-            result = pd.DataFrame(rows).dropna().query("email_text != ''")
-            print(f"  Ling-Spam: {len(result):,} rows ({result['label'].sum():,} spam)")
-            return result
+    all_rows = []
+    for fname, cfg in KNOWN_FILES.items():
+        candidates = list(RAW.rglob(fname)) + list(RAW.rglob(fname.lower()))
+        if not candidates:
+            print(f"  [SKIP] {fname} not found — extract from Kaggle zip")
+            continue
+        path = candidates[0]
+        print(f"\n  Loading {fname} from {path} ...")
+        try:
+            df = pd.read_csv(path, encoding="latin-1")
+            cols_lower = {c.lower().strip(): c for c in df.columns}
+            print(f"    Columns: {list(df.columns)}")
 
-    if dir_path.exists():
-        rows = []
-        for fpath in dir_path.rglob("*.txt"):
-            label = 1 if "spmsg" in fpath.name or "spam" in str(fpath) else 0
-            try:
-                text = fpath.read_text(encoding="utf-8", errors="ignore")
-                rows.append({"email_text": _clean_email_text(text), "label": label, "source": "lingspam"})
-            except Exception: pass
-        result = pd.DataFrame(rows).dropna().query("email_text != ''") if rows else pd.DataFrame()
-        if not result.empty:
-            print(f"  Ling-Spam: {len(result):,} rows ({result['label'].sum():,} spam)")
-        return result
+            text_col = next(
+                (cols_lower[k] for k in cfg["text"] if k in cols_lower), None
+            )
+            if not text_col:
+                text_col = next(
+                    (cols_lower[k] for k in cols_lower if "body" in k or "text" in k or "mail" in k), None
+                )
 
-    print(f"  [SKIP] Ling-Spam not found. Download from Kaggle: mandygu/lingspam-dataset")
-    print(f"         Save CSV as: {RAW}/lingspam.csv  OR  extract directory to: {RAW}/lingspam/")
-    return pd.DataFrame()
+            label_col = next(
+                (cols_lower[k] for k in cfg["label"] if k in cols_lower), None
+            )
 
+            if not text_col:
+                print(f"    [WARN] Cannot identify text column. Skipping.")
+                continue
 
-# ── Dataset 5: Nazario phishing emails ───────────────────────────────────────
+            source = fname.replace(".csv","").lower().replace("spamassasin","spamassassin")
+            for _, row in df.iterrows():
+                text = _safe(row.get(text_col,""))
+                if not text: continue
 
-def load_nazario() -> pd.DataFrame:
-    """
-    Expects data/raw/nazario/ directory with .eml files, OR
-    data/raw/nazario.csv with columns: email_text, label
-    from: https://github.com/clair-ot/phishing-dataset
-    """
-    csv_path = RAW / "nazario.csv"
-    dir_path  = RAW / "nazario"
+                if label_col:
+                    raw_l = _safe(row.get(label_col,"")).lower()
+                    label = 1 if raw_l in ("1","spam","phishing","phish") else 0
+                elif cfg["default_label"] is not None:
+                    label = cfg["default_label"]
+                else:
+                    continue
 
-    if csv_path.exists():
-        print(f"  Loading Nazario from {csv_path}...")
-        df = pd.read_csv(csv_path)
-        cols = {c.lower(): c for c in df.columns}
-        text_col = next((cols[k] for k in cols if "text" in k or "body" in k or "email" in k), None)
-        if text_col:
-            rows = [{"email_text": _clean_email_text(_safe_str(r[text_col])), "label": 1, "source": "nazario"}
-                    for _, r in df.iterrows()]
-            result = pd.DataFrame(rows).dropna().query("email_text != ''")
-            print(f"  Nazario: {len(result):,} phishing emails")
-            return result
+                all_rows.append({"email_text": _clean(text), "label": label, "source": source})
 
-    if dir_path.exists():
-        rows = []
-        for fpath in dir_path.rglob("*.eml"):
-            try:
-                text = fpath.read_text(encoding="utf-8", errors="ignore")
-                rows.append({"email_text": _clean_email_text(text), "label": 1, "source": "nazario"})
-            except Exception: pass
-        result = pd.DataFrame(rows).dropna().query("email_text != ''") if rows else pd.DataFrame()
-        if not result.empty:
-            print(f"  Nazario: {len(result):,} phishing emails")
-        return result
+            loaded = len([r for r in all_rows if r["source"] == source])
+            print(f"    Loaded: {loaded:,} rows")
+        except Exception as e:
+            print(f"    [ERROR] {e}")
 
-    print(f"  [SKIP] Nazario not found.")
-    print(f"         Clone: git clone https://github.com/clair-ot/phishing-dataset {RAW}/nazario")
-    print(f"         OR place CSV at: {RAW}/nazario.csv")
-    return pd.DataFrame()
+    return pd.DataFrame(all_rows) if all_rows else pd.DataFrame()
 
 
-# ── Dataset 6: Nigerian Fraud ────────────────────────────────────────────────
-
-def load_nigerian() -> pd.DataFrame:
-    """
-    Expects data/raw/nigerian_fraud.csv
-    from Kaggle: ambityga/email-classificaton  OR  monkey-learn spam datasets
-    Columns typically: v1 (ham/spam), v2 (text)
-    """
-    candidates = list(RAW.glob("nigerian*.csv")) + list(RAW.glob("*fraud*.csv")) + list(RAW.glob("*sms*.csv")) + list(RAW.glob("spam*.csv"))
-    if not candidates:
-        print(f"  [SKIP] Nigerian fraud CSV not found in {RAW}")
-        print(f"         Download from Kaggle: ambityga/email-classificaton")
-        print(f"         Save as: {RAW}/nigerian_fraud.csv")
+def load_ceas() -> pd.DataFrame:
+    path = RAW / "CEAS_08.csv"
+    if not path.exists():
         return pd.DataFrame()
-
-    path = candidates[0]
-    print(f"  Loading Nigerian fraud from {path}...")
-    df = pd.read_csv(path, encoding="latin-1")
-    cols_lower = {c.lower().strip(): c for c in df.columns}
-
-    # Common column layouts
-    text_col  = next((cols_lower[k] for k in ["v2","text","body","message","email"] if k in cols_lower), None)
-    label_col = next((cols_lower[k] for k in ["v1","label","class","category","spam"] if k in cols_lower), None)
-
-    if not text_col or not label_col:
-        print(f"  [WARN] Unrecognised columns: {list(df.columns)}")
-        return pd.DataFrame()
-
+    print(f"\n  Loading CEAS-2008 from {path} ...")
+    df = pd.read_csv(path)
     rows = []
     for _, r in df.iterrows():
-        text  = _safe_str(r[text_col])
-        raw_l = _safe_str(r[label_col]).lower()
-        label = 1 if "spam" in raw_l or raw_l == "1" else 0
-        rows.append({"email_text": _clean_email_text(text), "label": label, "source": "nigerian"})
+        text = f"From: {_safe(r.get('sender',''))}\nSubject: {_safe(r.get('subject',''))}\n\n{_safe(r.get('body',''))}"
+        rows.append({"email_text": _clean(text), "label": int(r["label"]), "source": "ceas2008"})
     result = pd.DataFrame(rows).dropna().query("email_text != ''")
-    print(f"  Nigerian: {len(result):,} rows ({result['label'].sum():,} spam/fraud)")
+    print(f"  CEAS-2008: {len(result):,} rows  ({int(result.label.sum()):,} phish)")
     return result
 
 
-# ── Combine + balance ─────────────────────────────────────────────────────────
+def combine_and_save(dfs):
+    combined = pd.concat([d for d in dfs if d is not None and not d.empty], ignore_index=True)
+    before = len(combined)
+    combined = combined.drop_duplicates(subset=["email_text"])
+    after = len(combined)
+    combined = combined[combined["email_text"].str.len() > 50]
 
-def combine_and_save(dfs: list[pd.DataFrame]) -> pd.DataFrame:
-    """
-    Merge all datasets, de-duplicate by email_text hash,
-    report class balance, and save.
-    """
-    all_df = pd.concat([d for d in dfs if not d.empty], ignore_index=True)
-    before = len(all_df)
-    all_df = all_df.drop_duplicates(subset=["email_text"])
-    after  = len(all_df)
-    print(f"\n  De-duplicated: {before:,} → {after:,} ({before-after:,} removed)")
+    print(f"\n{'─'*56}")
+    print(f"  COMBINED CORPUS")
+    print(f"{'─'*56}")
+    print(f"  Total (before dedup): {before:,}")
+    print(f"  After dedup:          {after:,}")
+    print(f"  After min-length:     {len(combined):,}")
+    n_phish = int(combined.label.sum())
+    n_legit = len(combined) - n_phish
+    print(f"  Phishing:             {n_phish:,}  ({n_phish/len(combined):.1%})")
+    print(f"  Legitimate:           {n_legit:,}  ({n_legit/len(combined):.1%})")
+    print()
+    for src, grp in combined.groupby("source"):
+        p = int(grp.label.sum())
+        print(f"    {src:<22} {len(grp):>7,}  ({p:,} phish)")
 
-    n_phish = int(all_df["label"].sum())
-    n_legit = len(all_df) - n_phish
-    print(f"  Class balance: phish={n_phish:,} ({n_phish/len(all_df):.1%})  legit={n_legit:,}")
-    print(f"\n  Source breakdown:")
-    for src, grp in all_df.groupby("source"):
-        p = int(grp["label"].sum())
-        print(f"    {src:<20} {len(grp):>6,} rows  ({p:,} phish)")
+    combined = combined.sample(frac=1, random_state=42).reset_index(drop=True)
+    outpath = OUT / "phishbyte_v3_corpus.csv"
+    combined.to_csv(outpath, index=False)
+    print(f"\n  Saved → {outpath}")
+    print(f"\n  Next step:")
+    print(f"  python train/train.py --data data/combined/phishbyte_v3_corpus.csv --skip-spf")
+    return combined
 
-    all_df = all_df.sample(frac=1, random_state=42).reset_index(drop=True)
-    all_df.to_csv(OUT_CSV, index=False)
-    print(f"\n  Saved {len(all_df):,} rows → {OUT_CSV}")
-    return all_df
-
-
-# ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--all",        action="store_true", help="Load all datasets")
-    parser.add_argument("--dataset",    type=str, default=None,
-                        choices=["ceas","enron","spamassassin","lingspam","nazario","nigerian"],
-                        help="Load a single dataset for testing")
-    parser.add_argument("--kaggle-key", type=str, default=None, help="Path to kaggle.json")
+    parser.add_argument("--check-existing", action="store_true",
+                        help="Scan data/raw/ to see what files you already have")
+    parser.add_argument("--spamassassin", action="store_true",
+                        help="Download SpamAssassin from Apache (no login)")
+    parser.add_argument("--kaggle", action="store_true",
+                        help="Load Enron/Ling/Nazario/Nigerian from Kaggle zip")
+    parser.add_argument("--all", action="store_true",
+                        help="Combine everything available into v3 corpus")
     args = parser.parse_args()
 
-    print(f"\n{'═'*60}")
-    print(f"  PHISH_BYTE v3 — MULTI-DATASET ACQUISITION")
-    print(f"{'═'*60}\n")
+    print(f"\n{'═'*56}")
+    print(f"  PHISH_BYTE v3 — DATASET ACQUISITION")
+    print(f"{'═'*56}")
 
-    loaders = {
-        "ceas":          load_ceas,
-        "enron":         load_enron_kaggle,
-        "spamassassin":  load_spamassassin,
-        "lingspam":      load_lingspam,
-        "nazario":       load_nazario,
-        "nigerian":      load_nigerian,
-    }
+    if args.check_existing:
+        check_existing()
+        return
 
-    if args.dataset:
-        df = loaders[args.dataset]()
+    if args.spamassassin:
+        df = load_spamassassin()
         if not df.empty:
-            out = COMBINED / f"{args.dataset}_preview.csv"
-            df.head(100).to_csv(out, index=False)
-            print(f"\n  Preview saved → {out}")
+            df.to_csv(OUT / "spamassassin.csv", index=False)
+            print(f"  Saved → {OUT}/spamassassin.csv")
+        return
+
+    if args.kaggle:
+        df = load_kaggle_combined()
+        if not df.empty:
+            df.to_csv(OUT / "kaggle_combined.csv", index=False)
+            print(f"  Saved → {OUT}/kaggle_combined.csv")
         return
 
     if args.all:
-        print("  Loading all 6 datasets...\n")
         dfs = []
-        for name, fn in loaders.items():
-            print(f"  ── {name.upper()} ──")
-            dfs.append(fn())
-        print(f"\n{'─'*60}")
+        print("\n  Step 1 — CEAS-2008")
+        dfs.append(load_ceas())
+        print("\n  Step 2 — Kaggle combined (Enron/Ling/Nazario/Nigerian)")
+        dfs.append(load_kaggle_combined())
+        print("\n  Step 3 — SpamAssassin (auto-download)")
+        dfs.append(load_spamassassin())
         combine_and_save(dfs)
-        print(f"\n  Run training:")
-        print(f"  python train/train.py --data data/combined/phishbyte_v3_corpus.csv --skip-spf")
-        print(f"{'═'*60}\n")
-    else:
-        print("  Usage: python train/acquire_datasets.py --all")
-        print("         python train/acquire_datasets.py --dataset spamassassin")
+        return
 
+    print("  Usage:")
+    print("  python train/acquire_datasets.py --check-existing")
+    print("  python train/acquire_datasets.py --spamassassin")
+    print("  python train/acquire_datasets.py --kaggle")
+    print("  python train/acquire_datasets.py --all")
 
 if __name__ == "__main__":
     main()
