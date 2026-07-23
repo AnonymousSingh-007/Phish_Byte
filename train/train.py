@@ -28,7 +28,7 @@ def _dataset_fingerprint(samples):
     for raw, label in samples:
         h.update(raw[:100].encode("utf-8", errors="ignore"))
         h.update(str(label).encode())
-    h.update(b"v4")
+    h.update(b"v5")
     return h.hexdigest()[:16]
 
 
