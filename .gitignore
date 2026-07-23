@@ -15,16 +15,24 @@ phishbyte/model/weights/
 *.pt
 *.pth
 *.ckpt
+*.safetensors
+
+# Feature cache — these are large binary files, rebuild with train.py
+train/cache/
+*.pkl
 
 # Training artifacts
 train/runs/
 train/logs/
 *.log
 
-# Dataset files (too large for git)
+# Dataset files — too large for git, download separately
 data/
 *.csv
 *.eml
+*.tar.bz2
+*.zip
+*.bz2
 
 # SHAP cache
 shap_cache/
