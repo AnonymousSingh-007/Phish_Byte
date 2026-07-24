@@ -221,3 +221,6 @@ def build_feature_vector(
     tfidf_vals = list(tfidf_features.values())
 
     return torch.tensor(static + tfidf_vals, dtype=torch.float32)
+
+# Backward compatibility alias — static features only
+FEATURE_NAMES = _STATIC_FEATURES
