@@ -1,11 +1,10 @@
 """
-train/calibrate_thresholds.py — v3
-CRITICAL FIX: don't write thresholds for a layer with no signal (J < 0.3).
-Without this, Layer 1 calibration on low-signal data produces useless
-thresholds that short-circuit every email to "legitimate".
+train/calibrate_thresholds.py — v4
+Updated for v7 pipeline: 6-argument build_feature_vector (domain, url, spf, subject, bdi, tfidf)
 """
 import os, sys, argparse, random
-import numpy as np, torch
+import numpy as np
+import torch
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
@@ -23,20 +22,24 @@ def main():
     if args.skip_spf:
         os.environ["PHISHBYTE_SKIP_SPF"] = "1"
 
-    from phishbyte.extractors.domain  import score_domain
-    from phishbyte.extractors.urls    import score_urls
-    from phishbyte.extractors.spf     import score_spf
-    from phishbyte.extractors.subject import score_subject
-    from phishbyte.model.mlp          import PhishByteMLPLayer, build_feature_vector
-    from phishbyte.calibration        import calibrate_layer, save_thresholds, ThresholdConfig
+    from phishbyte.extractors.domain         import score_domain
+    from phishbyte.extractors.urls           import score_urls
+    from phishbyte.extractors.spf            import score_spf
+    from phishbyte.extractors.subject        import score_subject
+    from phishbyte.extractors.bdi            import score_bdi
+    from phishbyte.extractors.tfidf_features import TFIDFVocab
+    from phishbyte.model.mlp                 import PhishByteMLPLayer, build_feature_vector
+    from phishbyte.calibration               import calibrate_layer, save_thresholds, ThresholdConfig
 
-    WEIGHTS = os.path.join(ROOT, "phishbyte", "model", "weights", "phishbyte_mlp.pt")
-    OUTPATH = os.path.join(ROOT, "phishbyte", "model", "weights", "thresholds.json")
+    WEIGHTS  = os.path.join(ROOT, "phishbyte", "model", "weights", "phishbyte_mlp.pt")
+    VOCAB    = os.path.join(ROOT, "phishbyte", "model", "weights", "tfidf_vocab.json")
+    OUTPATH  = os.path.join(ROOT, "phishbyte", "model", "weights", "thresholds.json")
 
     print(f"\n{'═'*52}")
-    print(f"  PHISH_BYTE — THRESHOLD CALIBRATION (v3)")
+    print(f"  PHISH_BYTE — THRESHOLD CALIBRATION (v4)")
     print(f"{'═'*52}")
 
+    # Load data
     if args.data and os.path.exists(args.data):
         import pandas as pd
         df = pd.read_csv(args.data).dropna()
@@ -53,58 +56,76 @@ def main():
         samples = generate_dataset(n_phish=200, n_legit=200)
         print(f"  Source: synthetic ({len(samples)} samples)")
 
+    # Load model
     if os.path.exists(WEIGHTS):
         model = PhishByteMLPLayer()
         model.load_state_dict(torch.load(WEIGHTS, map_location="cpu", weights_only=True))
         model.eval()
         has_model = True
-        print(f"  MLP loaded — calibrating both layers")
+        print(f"  MLP loaded")
     else:
         has_model = False
         print(f"  No MLP weights — Layer 1 only")
 
+    # Load TF-IDF vocab
+    if os.path.exists(VOCAB):
+        vocab = TFIDFVocab.load(VOCAB)
+        print(f"  TF-IDF vocab loaded ({len(vocab.vocab)} terms)")
+    else:
+        vocab = None
+        print(f"  No TF-IDF vocab — TF-IDF features will be zero")
+
+    # Extract features
     l1_scores, l2_scores, labels = [], [], []
+    skipped = 0
     for raw, label in samples:
         try:
-            d = score_domain(raw); u = score_urls(raw)
-            s = score_spf(raw);    sub = score_subject(raw)
-            l1 = min(1.0, d["score"]*0.30 + u["score"]*0.30 + sub["score"]*0.25 + s["score"]*0.15)
-            l1_scores.append(l1); labels.append(label)
+            d   = score_domain(raw)
+            u   = score_urls(raw)
+            s   = score_spf(raw)
+            sub = score_subject(raw)
+            bdi = score_bdi(raw)
+            tfi = vocab.transform(raw) if vocab else \
+                  {f"tfidf_pad_{i}": 0.0 for i in range(50)}
+
+            l1 = min(1.0,
+                d["score"]*0.25 + u["score"]*0.25 +
+                sub["score"]*0.20 + bdi["score"]*0.20 + s["score"]*0.10
+            )
+            l1_scores.append(l1)
+            labels.append(label)
+
             if has_model:
-                fvec = build_feature_vector(d, u, s, sub)
+                fvec = build_feature_vector(d, u, s, sub, bdi, tfi)
                 l2_scores.append(model.predict_proba(fvec))
-        except Exception:
+        except Exception as e:
+            skipped += 1
             continue
 
-    l1 = np.array(l1_scores); labels = np.array(labels)
+    if skipped:
+        print(f"  Skipped {skipped} samples due to errors")
+
+    l1 = np.array(l1_scores)
+    labels_arr = np.array(labels)
 
     print(f"\n  L1 score distribution:")
-    print(f"    phish samples : mean {l1[labels==1].mean():.3f}  std {l1[labels==1].std():.3f}")
-    print(f"    legit samples : mean {l1[labels==0].mean():.3f}  std {l1[labels==0].std():.3f}")
+    print(f"    phish : mean {l1[labels_arr==1].mean():.3f}  std {l1[labels_arr==1].std():.3f}")
+    print(f"    legit : mean {l1[labels_arr==0].mean():.3f}  std {l1[labels_arr==0].std():.3f}")
 
     print(f"\n  Calibrating Layer 1...")
-    cfg1 = calibrate_layer(l1, labels, "layer1", 0.95, 0.95)
+    cfg1 = calibrate_layer(l1, labels_arr, "layer1", 0.95, 0.95)
     print(f"    phish≥{cfg1.phish_threshold:.4f}  precision={cfg1.phish_precision:.3f}")
     print(f"    clean≤{cfg1.clean_threshold:.4f}  recall  ={cfg1.clean_recall:.3f}")
     print(f"    Youden J={cfg1.youden_j:.3f}")
 
     configs = {}
-
     if cfg1.youden_j < MIN_USEFUL_J:
-        print(f"\n  [WARN] Layer 1 Youden J={cfg1.youden_j:.3f} below useful threshold ({MIN_USEFUL_J}).")
-        print(f"         Layer 1 has insufficient signal on this dataset.")
-        print(f"         Writing SAFE FALLBACK thresholds for Layer 1 (extreme-only veto):")
-        print(f"         phish≥0.85  clean≤0.05  (will route almost everything to MLP)")
+        print(f"\n  [WARN] Layer 1 J={cfg1.youden_j:.3f} below threshold.")
+        print(f"  Writing safe fallback: phish≥0.85  clean≤0.05")
         cfg1_safe = ThresholdConfig(
-            layer="layer1",
-            phish_threshold=0.85,
-            clean_threshold=0.05,
-            phish_precision=0.0,
-            clean_recall=0.0,
-            youden_j=cfg1.youden_j,
-            coverage=0.0,
-            notes=f"Calibration produced unusable thresholds (J={cfg1.youden_j:.3f}). "
-                  f"Using safe veto-only fallback. MLP handles routing."
+            layer="layer1", phish_threshold=0.85, clean_threshold=0.05,
+            phish_precision=0.0, clean_recall=0.0, youden_j=cfg1.youden_j,
+            coverage=0.0, notes=f"J={cfg1.youden_j:.3f} below useful. Safe veto-only fallback."
         )
         configs["layer1"] = cfg1_safe
     else:
@@ -114,11 +135,11 @@ def main():
     if has_model:
         l2 = np.array(l2_scores)
         print(f"\n  L2 score distribution:")
-        print(f"    phish samples : mean {l2[labels==1].mean():.3f}  std {l2[labels==1].std():.3f}")
-        print(f"    legit samples : mean {l2[labels==0].mean():.3f}  std {l2[labels==0].std():.3f}")
+        print(f"    phish : mean {l2[labels_arr==1].mean():.3f}  std {l2[labels_arr==1].std():.3f}")
+        print(f"    legit : mean {l2[labels_arr==0].mean():.3f}  std {l2[labels_arr==0].std():.3f}")
 
         print(f"\n  Calibrating Layer 2...")
-        cfg2 = calibrate_layer(l2, labels, "layer2", 0.95, 0.95)
+        cfg2 = calibrate_layer(l2, labels_arr, "layer2", 0.95, 0.95)
         print(f"    phish≥{cfg2.phish_threshold:.4f}  precision={cfg2.phish_precision:.3f}")
         print(f"    clean≤{cfg2.clean_threshold:.4f}  recall  ={cfg2.clean_recall:.3f}")
         print(f"    Youden J={cfg2.youden_j:.3f}  Coverage={cfg2.coverage:.1%}")
