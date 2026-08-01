@@ -1,6 +1,7 @@
 """
-update_hub_metadata.py — v7
-Updates HuggingFace model card with v7 benchmarks, 85 features, 254K params.
+update_hub_metadata.py — v8
+Fixes the broken install instructions on the HuggingFace model card.
+Makes explicit: no PyPI package yet, clone required.
 """
 import os, sys, argparse, tempfile
 
@@ -77,15 +78,27 @@ widget:
 
 A from-scratch PyTorch model for **email phishing detection**.
 
-**F1 0.950** on 5,000 held-out samples from a 6-corpus benchmark.
-**254K parameters** (≈260× smaller than DistilBERT).
+**F1 0.950** on 5,000 held-out samples from a 6-corpus benchmark (self-reported — see Limitations).
+**254K parameters** (≈260x smaller than DistilBERT).
 **995 emails/sec** on a laptop GPU.
-**85 engineered features** (35 rule-based + 50 TF-IDF learned from corpus).
+**85 engineered features** (35 rule-based + 50 TF-IDF learned from the training corpus).
 Every verdict explains itself with full per-feature attribution.
 
-> **The only non-transformer phishing detection model on HuggingFace.**
+> The only non-transformer phishing detection model on HuggingFace.
 
-## Quick start
+## ⚠️ Installation — no PyPI package yet
+
+**This model is NOT installable via `pip install phishbyte`.** That package does not exist yet (it's on the roadmap). The only working install path today is cloning the source repository:
+
+```bash
+git clone https://github.com/AnonymousSingh-007/Phish_Byte.git
+cd Phish_Byte
+python -m venv venv && source venv/bin/activate   # or .\\venv\\Scripts\\Activate.ps1 on Windows
+pip install -r requirements.txt
+python verify_install.py    # confirms everything works before you start
+```
+
+Then, from inside the cloned folder:
 
 ```python
 from phishbyte import PhishByteEngine
@@ -100,33 +113,13 @@ print(verdict.layer_used)        # 2
 print(verdict.feature_weights)   # 85-feature attribution
 ```
 
+`from_pretrained()` downloads ~1 MB of weights, thresholds, and the TF-IDF vocabulary from this Hub repo automatically — no manual file management needed once the package is set up.
+
 ## Analyse a real email from Gmail
 
-1. Open the email in Gmail
-2. Click ⋮ → **Show original**
-3. Copy all (Ctrl+A, Ctrl+C)
-
-```python
-engine = PhishByteEngine.from_pretrained("SamSec007/phishbyte")
-verdict = engine.analyze(pasted_raw_email)
-print(verdict)
-```
-
-Or save as `.eml` and run:
-
-```bash
-python cli.py --file suspicious.eml
-```
-
-## What changed in v7
-
-- **85 features** (was 29) — added 50 TF-IDF unigrams + 3 BDI features + 2 domain features + 1 composite
-- **254K parameters** (was 12K) — deeper residual MLP with two ResBlocks and input skip connection
-- **6-dataset training** (was CEAS-2008 only) — Enron, SpamAssassin, Ling-Spam, Nazario, Nigerian Fraud
-- **TF-IDF vocabulary** — 50 most discriminative unigrams learned from training corpus. No pretrained LM.
-- **Body Domain Identification** — most common link domain mismatch, form action mismatch, external link ratio
-- **Display name spoofing** — catches "PayPal Security" \\<attacker@evil.com\\>
-- **Calibrated training metrics** — F1 at Youden-optimal threshold, not naive 0.5 cutoff
+1. Open the email → ⋮ menu → **Show original**
+2. Copy all (Ctrl+A, Ctrl+C)
+3. Paste into `python cli.py` when prompted, or save as `.eml` and run `python cli.py --file suspicious.eml`
 
 ## Architecture
 
@@ -134,23 +127,25 @@ python cli.py --file suspicious.eml
 raw email
   → Layer 1 (6 rule scorers, ~1ms) → veto gate (obvious phishing only)
   → Layer 2 (residual MLP, ~3ms)
-      85 → 360 → 180 (×2 ResBlock) → 90 → 48 → 1 (sigmoid)
+      85 → 360 → 180 (x2 ResBlock) → 90 → 48 → 1 (sigmoid)
       + input-to-output skip connection
   → PhishVerdict {label, probability, confidence, layer_used, feature_weights}
 ```
 
-## Benchmarks (5,000 held-out, 6-corpus)
+## Benchmarks (5,000 held-out, self-reported on 6-corpus split)
 
 | Metric | Phish_Byte v7 | DistilBERT fine-tuned |
 |--------|:------------:|:---------------------:|
-| F1 score | **0.950** | ~0.967 |
-| Accuracy | **94.94%** | ~97% |
-| Parameters | **254K** | 66,000,000 |
-| Model size | **~1 MB** | ~263 MB |
-| Throughput (GPU) | **995/sec** | ~50/sec |
-| GPU required | **No** | Practically yes |
-| Header + SPF analysis | **Yes** | No |
-| Per-feature attribution | **85 features** | Token-level SHAP |
+| F1 score | 0.950 | ~0.967 |
+| Accuracy | 94.94% | ~97% |
+| Parameters | 254K | 66,000,000 |
+| Model size on disk | ~1 MB | ~263 MB |
+| Throughput (GPU) | 995/sec | ~50/sec |
+| GPU required | No | Practically yes |
+| Header + SPF analysis | Yes | No |
+| Per-feature attribution | 85 features | Token-level SHAP |
+
+**Note on comparability:** the DistilBERT figure is self-reported by a different author on a different data split. This is not an apples-to-apples benchmark — treat both numbers as directional, not authoritative. A head-to-head evaluation on a shared held-out set is planned (see Roadmap).
 
 ## Feature groups (85 total)
 
@@ -166,24 +161,30 @@ raw email
 
 ## Training data
 
-CEAS-2008 + Enron + SpamAssassin + Ling-Spam + Nazario + Nigerian Fraud = **~83K emails** (balanced 50/50).
+CEAS-2008 + Enron + SpamAssassin + Ling-Spam + Nazario + Nigerian Fraud = ~83K emails (balanced ~50/50).
 
-Same 6-corpus benchmark used by the top DistilBERT model on HuggingFace.
+**All source corpora are from 2003–2008.** This is a material limitation — see below.
+
+## Limitations — read before deploying
+
+- **Training data is 15+ years old.** The corpora (Enron, Nazario, SpamAssassin, etc.) predate modern phishing techniques: OAuth phishing, QR code lures, redirect chains through legitimate services (Google Docs, Dropbox, OneDrive), and adversarial HTML obfuscation. Recall on 2020s-era attacks is untested and likely degraded. Retraining on modern corpora (PhishTank, OpenPhish, APWG eCrime) is planned.
+- **TF-IDF vocabulary is era-locked.** The 50 learned terms reflect 2003–2008 phishing language ("click here," "verify account"). Modern phishing vocabulary ("access your document," "complete verification") is not represented and won't be caught by this signal.
+- **No adversarial robustness testing has been performed.** An attacker aware of the feature set (rule-based signals + fixed TF-IDF vocabulary) could plausibly craft inputs that evade detection — e.g., avoiding known TF-IDF terms, spoofing SPF-adjacent signals, or using benign-looking redirect infrastructure. This model has not been red-teamed. Treat it as one signal in a defence-in-depth stack, not a standalone gate.
+- **F1 0.950 is self-reported** on a held-out split of the training corpus, not an independently verified benchmark. Numbers should be treated as directional.
+- **Not production-hardened.** No retry logic, rate limiting, or async SPF handling.
+- **English-language only.**
 
 ## Install
 
 ```bash
-pip install huggingface_hub safetensors dnspython
+pip install -r requirements.txt
 ```
 
-## Limitations
-
-- ~5% error rate. Use as one signal in defence-in-depth.
-- Trained on English-language phishing (2003–2008 era). Modern attacks and non-English emails will degrade recall.
-- SPF validation skipped for training (historical domains). Re-enables at inference on live emails.
-- TF-IDF vocabulary is corpus-specific. Retrain on your own data for best domain fit.
+Minimal deps: `torch`, `huggingface_hub`, `safetensors`, `dnspython`, `numpy`, `pandas`.
 
 ## Citation
+
+No peer-reviewed paper exists yet for this model — an arXiv preprint is planned. Until then, cite the repository directly:
 
 ```bibtex
 @software{phishbyte2026,
@@ -193,6 +194,15 @@ pip install huggingface_hub safetensors dnspython
   url    = {https://github.com/AnonymousSingh-007/Phish_Byte}
 }
 ```
+
+## Roadmap
+
+- [ ] Retrain on 2020–2024 phishing data (PhishTank, OpenPhish, APWG eCrime)
+- [ ] Adversarial robustness test suite + documented known bypasses
+- [ ] Head-to-head benchmark vs DistilBERT on a shared held-out set
+- [ ] HuggingFace Space demo
+- [ ] PyPI package (`pip install phishbyte`)
+- [ ] arXiv preprint
 
 ## License
 
@@ -206,7 +216,7 @@ def main():
     args = parser.parse_args()
 
     print(f"\n{'═'*56}")
-    print(f"  PHISH_BYTE v7 — HUB MODEL CARD UPDATE")
+    print(f"  PHISH_BYTE — HUB MODEL CARD FIX (install + honesty pass)")
     print(f"{'═'*56}")
 
     try:
@@ -214,36 +224,38 @@ def main():
         api = HfApi()
         whoami = api.whoami()
         print(f"  Logged in as: {whoami['name']}")
-    except Exception as e:
+    except Exception:
         print(f"  [ERROR] Not logged in. Run: hf auth login")
         sys.exit(1)
 
-    print(f"  Uploading v7 model card to {args.repo_id}...")
     with tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False, encoding="utf-8") as f:
         f.write(CARD)
         tmppath = f.name
-
     try:
         upload_file(
-            path_or_fileobj=tmppath,
-            path_in_repo="README.md",
-            repo_id=args.repo_id,
-            commit_message="Update model card — v7: 85 features, 254K params, F1 0.950, 6-dataset",
+            path_or_fileobj=tmppath, path_in_repo="README.md", repo_id=args.repo_id,
+            commit_message="Fix broken install instructions, add honest limitations section",
         )
         print(f"  Model card updated.")
     finally:
         os.unlink(tmppath)
 
-    print(f"\n  What changed:")
-    print(f"  + F1 updated to 0.950 (was 0.948)")
-    print(f"  + Parameters updated to 254K (was 12K)")
-    print(f"  + 85 features documented (was 29)")
-    print(f"  + 6-dataset training documented")
-    print(f"  + TF-IDF + BDI features explained")
-    print(f"  + Gmail 'Show original' usage guide added")
-    print(f"  + v7 changelog section added")
-    print(f"  + 21 tags (was 19) — added tfidf, residual-network")
-    print(f"  + 6 datasets listed in metadata")
+    # Also push requirements.txt to the Hub repo itself
+    req_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "requirements.txt")
+    if os.path.exists(req_path):
+        upload_file(
+            path_or_fileobj=req_path, path_in_repo="requirements.txt", repo_id=args.repo_id,
+            commit_message="Add requirements.txt to Hub repo",
+        )
+        print(f"  requirements.txt uploaded to Hub repo.")
+
+    print(f"\n  Fixed:")
+    print(f"  - Removed implied 'pip install phishbyte' — now explicit clone instructions")
+    print(f"  - Added verify_install.py reference")
+    print(f"  - Added honest limitations: data age, TF-IDF staleness, no adversarial testing")
+    print(f"  - Flagged F1 as self-reported, benchmark as non-comparable")
+    print(f"  - Citation now says 'no paper yet' instead of implying one exists")
+    print(f"  - Roadmap added directly to card")
     print(f"\n  View at: https://huggingface.co/{args.repo_id}")
     print(f"{'═'*56}\n")
 
