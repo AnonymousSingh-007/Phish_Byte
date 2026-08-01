@@ -4,7 +4,7 @@
 
 <br/>
 
-[![Model on HuggingFace](https://img.shields.io/badge/🤗_Model-SamSec007%2Fphishbyte-FFD21E?style=for-the-badge)](https://huggingface.co/SamSec007/phishbyte)
+[![Model on HuggingFace](https://img.shields.io/badge/🤗_Try_it_on-HuggingFace-FFD21E?style=for-the-badge)](https://huggingface.co/SamSec007/phishbyte)
 ![PyTorch](https://img.shields.io/badge/PyTorch-2.11+cu128-EE4C2C?style=for-the-badge&logo=pytorch&logoColor=white)
 ![Python](https://img.shields.io/badge/Python-3.11-3776AB?style=for-the-badge&logo=python&logoColor=white)
 ![License](https://img.shields.io/badge/License-MIT-blueviolet?style=for-the-badge)
@@ -16,7 +16,6 @@
 ![Throughput](https://img.shields.io/badge/Throughput-995_emails%2Fsec-00FF88?style=flat-square)
 ![Parameters](https://img.shields.io/badge/Parameters-254K-blue?style=flat-square)
 ![Features](https://img.shields.io/badge/Features-85_(35_rule+50_TF--IDF)-orange?style=flat-square)
-![Datasets](https://img.shields.io/badge/Training-6_datasets_%C2%B783K_emails-orange?style=flat-square)
 ![Stars](https://img.shields.io/github/stars/AnonymousSingh-007/Phish_Byte?style=flat-square&color=yellow)
 
 </div>
@@ -25,9 +24,36 @@
 
 A PyTorch model for **email phishing detection** trained entirely from scratch on 6 public datasets.
 
-**F1 0.950** on 5,000 held-out samples. **254K parameters** (≈260× smaller than DistilBERT). **995 emails/sec** on a laptop GPU. **85 engineered features** including TF-IDF vocabulary learned from the training corpus — no pretrained language model, no transformer, no fine-tuning.
+**F1 0.950** on 5,000 held-out samples (self-reported — see [Limitations](#limitations)). **254K parameters** (≈260× smaller than DistilBERT). **995 emails/sec** on a laptop GPU. **85 engineered features** including a TF-IDF vocabulary learned directly from the training corpus — no pretrained language model, no transformer, no fine-tuning.
 
-Every verdict explains itself: which signals fired, which layer decided, how confident the model is.
+**👉 [Try it on the HuggingFace model page](https://huggingface.co/SamSec007/phishbyte)** — full model card, weights, and usage examples live there.
+
+---
+
+## Get started in 4 commands
+
+```bash
+git clone https://github.com/AnonymousSingh-007/Phish_Byte.git
+cd Phish_Byte
+python -m venv venv && source venv/bin/activate   # Windows: .\venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+```
+
+Then verify everything works before doing anything else:
+
+```bash
+python verify_install.py
+```
+
+This checks every dependency, every source file, and does a live test-download from HuggingFace Hub. If anything's wrong, it tells you exactly what — not a cryptic traceback. **Every install issue reported so far has been caught by this script.** Run it first.
+
+Once it's green:
+
+```bash
+python cli.py --demo phish
+```
+
+Or in Python, from inside the cloned folder:
 
 ```python
 from phishbyte import PhishByteEngine
@@ -42,28 +68,40 @@ print(verdict.layer_used)        # 2 — MLP made this call
 print(verdict.feature_weights)   # 85-feature attribution
 ```
 
+The first `from_pretrained()` call downloads ~1 MB of weights, thresholds, and the TF-IDF vocabulary from [huggingface.co/SamSec007/phishbyte](https://huggingface.co/SamSec007/phishbyte) and caches them locally. Every call after that is instant.
+
+**No PyPI package yet.** `pip install phishbyte` does not work — cloning is the only supported path right now (see [Roadmap](#roadmap)).
+
 ---
 
-## What changed in v7
+## Analyse a real email from Gmail
 
-| | v2 (original) | v7 (current) |
-|---|:---:|:---:|
-| Features | 29 | **85** (35 rule + 50 TF-IDF) |
-| Parameters | 12,545 | **253,987** |
-| Architecture | 29→128→64→1 | **85→360→180(×2 ResBlock)→90→48→1** |
-| Training data | CEAS-2008 only (39K) | **6 datasets (83K emails)** |
-| F1 score | 0.948 | **0.950** |
-| New extractors | — | **TF-IDF vocab, Body Domain ID** |
-| Skip connections | None | **Input-to-output residual** |
-| Training F1 metric | Naive 0.5 cutoff | **Youden-optimal threshold** |
+1. Open the email → click **⋮** menu → **Show original**
+2. Select all (Ctrl+A), copy (Ctrl+C)
+3. Run `python cli.py`, paste when prompted, press Enter then Ctrl+Z (Windows) or Ctrl+D (Mac/Linux)
 
-Key additions in v7:
-- **TF-IDF vocabulary** — 50 most discriminative unigrams learned from training corpus (no pretrained embeddings)
-- **Body Domain Identification (BDI)** — most common link domain mismatch, form action domain mismatch, external link ratio (inspired by BDI 2025 paper achieving 99.7% with 3 features)
-- **Display name spoofing** — catches `"PayPal Security" <attacker@evil.com>`
-- **Suspicious domain pattern** — heuristic for auto-generated phishing domains
-- **Two residual blocks** — deeper feature interaction learning at the 180-dim bottleneck
-- **Calibrated training metrics** — F1 at Youden-optimal threshold during training, no more misleading numbers
+Or save as `.eml` and run:
+
+```bash
+python cli.py --file suspicious.eml
+```
+
+---
+
+## Troubleshooting
+
+Run `python verify_install.py` first — it catches nearly everything below automatically with a specific fix.
+
+| Error | Fix |
+|-------|-----|
+| `ModuleNotFoundError: No module named 'phishbyte'` | Not running from inside the cloned repo, or venv not activated. `cd Phish_Byte`, reactivate venv. |
+| `ImportError: cannot import name 'X'` | Clone is out of date. `git pull origin main`. |
+| `pip install phishbyte` fails | Package doesn't exist on PyPI yet. Clone the repo instead (see above). |
+| `NameError: save_model_as_safetensor is not defined` | Missing `safetensors`. `pip install safetensors`. |
+| Model download hangs | Check internet. Hub: [huggingface.co/SamSec007/phishbyte](https://huggingface.co/SamSec007/phishbyte) |
+| Windows symlink warning during download | Harmless. Uses slightly more disk space. Ignore, or enable Windows Developer Mode to silence it. |
+
+Still stuck? [Open an issue](https://github.com/AnonymousSingh-007/Phish_Byte/issues) with your `verify_install.py` output attached.
 
 ---
 
@@ -74,9 +112,8 @@ Every phishing detection model on HuggingFace is a fine-tuned transformer — Di
 Phish_Byte takes a different bet:
 
 - **Custom MLP trained from scratch** — no pretrained weights, no fine-tuned LM
-- **85 engineered features** covering domain, URL, SPF, subject, body, character-level, BDI, and learned TF-IDF signals
+- **85 engineered features** covering domain, URL, SPF, subject, body, character-level, Body Domain Identification (BDI), and learned TF-IDF signals
 - **Cascading inference** — cheap rule scorers veto obvious cases, MLP handles the rest
-- **Full email header analysis** including live SPF validation and display-name spoofing detection
 - **Runs on CPU** — no GPU requirement for deployment
 - **Every verdict explains itself** — 85-feature attribution on every prediction
 
@@ -86,63 +123,58 @@ Phish_Byte takes a different bet:
 
 ## Benchmarks
 
-Evaluated on 5,000 held-out samples from the 6-dataset corpus (83K emails total, balanced ~50/50).
+Evaluated on 5,000 held-out samples from the 6-dataset training corpus (83K emails, balanced ~50/50).
 
-| Metric | Phish_Byte v7 | DistilBERT fine-tuned\* | Rule-based only |
-|--------|:------------:|:-----------------------:|:---------------:|
-| F1 score | **0.950** | ~0.967 | ~0.85 |
-| Accuracy | **94.94%** | ~97% | ~85% |
-| Precision | **0.9490** | ~0.97 | ~0.88 |
-| Recall | **0.9516** | ~0.97 | ~0.82 |
-| Parameters | **254K** | 66,000,000 | 0 |
-| Model size on disk | **~1 MB** | ~263 MB | 0 |
-| Throughput (GPU) | **995/sec** | ~50/sec | — |
-| GPU required | **No** | Practically yes | No |
-| Header analysis | **Yes — SPF, display name, BDI** | No | Partial |
-| Explainability | **85-feature attribution** | Token-level SHAP | — |
+| Metric | Phish_Byte v7 | DistilBERT fine-tuned\* |
+|--------|:------------:|:-----------------------:|
+| F1 score | **0.950** | ~0.967 |
+| Accuracy | **94.94%** | ~97% |
+| Parameters | **254K** | 66,000,000 |
+| Model size on disk | **~1 MB** | ~263 MB |
+| Throughput (GPU) | **995/sec** | ~50/sec |
+| GPU required | **No** | Practically yes |
+| Header + SPF analysis | **Yes** | No |
+| Explainability | **85-feature attribution** | Token-level SHAP |
 
-\* Baseline from `dima806/phishing-email-detection` and similar Hub models.
+\* Self-reported by a different author on a different data split (`dima806/phishing-email-detection`). **This is not an apples-to-apples benchmark** — treat both F1 numbers as directional. A shared-split head-to-head comparison is planned (see Roadmap).
+
+**Where the trade-off actually favors Phish_Byte:** 260× smaller model, 20× higher throughput, zero GPU requirement, full header/SPF analysis that body-only transformer models skip entirely.
 
 ---
 
-## Training data — 6 public datasets
+## Feature signals (85 total)
 
-| Dataset | Emails | Source |
-|---------|-------:|--------|
-| CEAS-2008 | 39,154 | CEAS Email Detection Challenge |
-| Enron | ~29K | Enron email corpus (labeled) |
-| SpamAssassin | ~10K | Apache SpamAssassin public corpus |
-| Nigerian Fraud | ~3.3K | Nigerian fraud email dataset |
-| Nazario | ~1.5K | Nazario phishing corpus |
-| Ling-Spam | ~2.8K | Ling-Spam benchmark |
-| **Total (after dedup)** | **~83K** | balanced ~50/50 phish/legit |
+| Category | Count | Features |
+|----------|:-----:|----------|
+| **Domain** | 7 | domain mismatch, Reply-To differs, Return-Path differs, freemail flag, brand impersonation, display name mismatch, suspicious domain pattern |
+| **URL + Body** | 10 | HTTPS ratio, anchor mismatch, suspicious TLD, urgency (normalized), link density (normalized), caps ratio, digit ratio, special char density, avg word length, HTML/text ratio |
+| **SPF** | 3 | SPF fail, no SPF record, no sending IP |
+| **Subject** | 7 | urgency, security theme, brand name, currency, all caps, fake `RE:` prefix, fake transaction IDs |
+| **BDI** | 3 | most common link domain mismatch, form action domain mismatch, external link ratio |
+| **TF-IDF** | 50 | top-50 discriminative unigrams learned from training corpus (no pretrained embeddings) |
+| **Composite** | 5 | per-module normalized layer scores |
 
 ---
 
 ## Architecture
 
 ```
-   raw email (.eml / raw headers+body / Gmail "Show Original")
+   raw email
        │
        ▼
 ┌──────────────────────────────────────────────────────────────────┐
 │ Layer 1 — 6 rule scorers                        ~1 ms per email │
-│                                                                 │
-│  domain    URL+body    SPF       subject     BDI      TF-IDF    │
-│  (7 feat)  (10 feat)   (3 feat)  (7 feat)   (3 feat) (50 feat) │
-│                                                                 │
-│  composite score ≥ 0.85  ──────────►  fast phish verdict        │
-│  (obvious spoofing / domain mismatch)                           │
+│  domain · URL+body · SPF · subject · BDI · TF-IDF               │
+│  composite score ≥ 0.85 → fast phish verdict (obvious cases)    │
 └────────────────────────────┬────────────────────────────────────┘
-                             │ everything else (~100% of traffic)
+                             │ everything else
                              ▼
 ┌──────────────────────────────────────────────────────────────────┐
 │ Layer 2 — residual MLP                          ~3 ms per email │
-│                                                                 │
-│  85 → 360 → 180 (×2 ResBlock) → 90 → 48 → 1  (sigmoid)        │
-│  + input-to-output skip connection                              │
+│  85 → 360 → 180 (×2 ResBlock) → 90 → 48 → 1  (sigmoid)         │
 │  254K parameters · trained from scratch · no pretrained LM      │
-│  + post-hoc per-feature attribution on every verdict            │
+│  + input-to-output skip connection                               │
+│  + post-hoc per-feature attribution                              │
 └────────────────────────────┬────────────────────────────────────┘
                              │
                              ▼
@@ -153,159 +185,32 @@ Evaluated on 5,000 held-out samples from the 6-dataset corpus (83K emails total,
 
 ---
 
-## Feature signals (85 total)
+## Training data
 
-| Category | Count | Features |
-|----------|:-----:|----------|
-| **Domain** | 7 | domain mismatch, Reply-To differs, Return-Path differs, freemail flag, brand impersonation, **display name mismatch**, **suspicious domain pattern** |
-| **URL + Body** | 10 | HTTPS ratio, anchor mismatch, suspicious TLD, urgency keywords (normalized/100 words), link density (normalized/100 words), caps ratio, digit ratio, special char density, avg word length, HTML/text ratio |
-| **SPF** | 3 | SPF fail, no SPF record, no sending IP |
-| **Subject** | 7 | urgency, security theme, brand name, currency, all caps, fake `RE:` prefix, fake transaction IDs |
-| **BDI** | 3 | **most common link domain mismatch**, **form action domain mismatch**, **external link ratio** |
-| **TF-IDF** | 50 | **top-50 discriminative unigrams learned from training corpus** (no pretrained embeddings — vocabulary fitted on your data) |
-| **Composite** | 5 | per-module normalized layer scores |
+| Dataset | Emails | Era |
+|---------|-------:|-----|
+| CEAS-2008 | 39,154 | 2008 |
+| Enron | ~29K | 1999–2002 |
+| SpamAssassin | ~10K | 2002–2003 |
+| Nigerian Fraud | ~3.3K | 2000s |
+| Nazario | ~1.5K | 2000s |
+| Ling-Spam | ~2.8K | 1990s–2000s |
+| **Total (after dedup)** | **~83K** | **balanced ~50/50** |
 
-**Bold = new in v7.** Display name mismatch catches `"PayPal Security" <attacker@random.com>`. BDI features detect when the most common link domain in the email body doesn't match the claimed sender — the strongest structural signal for phishing (BDI paper: 99.7% accuracy with just 3 features). TF-IDF features are vocabulary-agnostic — they learn the 50 most discriminative words from whatever training corpus you provide. No pretrained model needed.
-
----
-
-## Quickstart
-
-### From HuggingFace Hub
-
-```bash
-pip install huggingface_hub safetensors dnspython
-```
-
-```python
-from phishbyte import PhishByteEngine
-
-engine  = PhishByteEngine.from_pretrained("SamSec007/phishbyte")
-verdict = engine.analyze(raw_email_string)
-print(verdict)
-```
-
-### From source
-
-```bash
-git clone https://github.com/AnonymousSingh-007/Phish_Byte.git
-cd Phish_Byte
-
-py -3.11 -m venv venv
-.\venv\Scripts\Activate.ps1           # Windows
-# source venv/bin/activate              # Linux / Mac
-
-pip install -r requirements.txt
-```
-
-GPU (RTX 50-series / Blackwell):
-
-```bash
-pip install torch --index-url https://download.pytorch.org/whl/cu128
-```
+**All source corpora predate 2010.** See Limitations — this is the model's biggest known weakness, and retraining on modern data is the top roadmap item.
 
 ---
 
-## Usage
+## Limitations
 
-### Analyse a live email from Gmail
+Read this before deploying anywhere real.
 
-1. Open any email in Gmail
-2. Click ⋮ menu → **Show original**
-3. Copy all text (Ctrl+A, Ctrl+C)
-4. Run:
-
-```bash
-python cli.py
-# Paste the raw email, press Enter, then Ctrl+Z (Windows)
-```
-
-Or save a `.eml` file:
-
-```bash
-python cli.py --file suspicious.eml
-```
-
-### Demo mode (from training data)
-
-```bash
-python cli.py --demo phish          # known phishing sample
-python cli.py --demo legit          # known legitimate sample
-python cli.py --demo --json         # JSON output
-```
-
-### Python API
-
-```python
-from phishbyte import PhishByteEngine
-
-engine = PhishByteEngine()
-
-with open("suspicious.eml") as f:
-    verdict = engine.analyze(f.read())
-
-if verdict.label == "phishing" and verdict.confidence == "high":
-    quarantine(email)
-
-# Inspect what fired
-for feature, score in sorted(verdict.feature_weights.items(), key=lambda x: -x[1]):
-    if score > 0.1:
-        print(f"  {feature}: {score:.2f}")
-```
-
-### Verdict object
-
-```python
-PhishVerdict(
-    label           = "phishing",
-    probability     = 0.9735,          # P(phish) in [0, 1]
-    confidence      = "high",          # high | medium | low
-    layer_used      = 2,               # 1 = rules veto, 2 = MLP
-    feature_weights = {
-        "display_name_mismatch":     1.0,
-        "mcld_mismatch":             1.0,
-        "spf_fail":                  1.0,
-        "tfidf_verify":              0.82,
-        "tfidf_account":             0.74,
-        "urgency_score":             0.65,
-        "external_link_ratio":       0.90,
-        ...
-    },
-    detail = "MLP probability: 97.35%. L1 score: 19.76%.",
-)
-```
-
----
-
-## Train your own
-
-```bash
-# 1. Place all CSVs from Kaggle (naserabdullahalam) in data/raw/
-python train/acquire_datasets.py --all
-
-# 2. Train (fits TF-IDF vocab automatically on first run)
-python train/train.py --data data/combined/phishbyte_v3_corpus.csv --skip-spf
-
-# 3. Calibrate confidence gates
-python train/calibrate_thresholds.py --data data/combined/phishbyte_v3_corpus.csv --n-val 5000
-
-# 4. Evaluate
-python eval.py --n 5000
-
-# 5. Push to Hub
-python push_to_hub.py --repo-id YOUR_HF_USERNAME/phishbyte
-```
-
-Feature extraction is cached — 83K emails extract in ~3 minutes first time, then instant.
-
----
-
-## What this is not
-
-- **Not a transformer.** No BERT, no fine-tuning, no pretrained weights. The MLP is randomly initialised and trained from scratch. TF-IDF vocabulary is learned from the training corpus, not from any external LM.
-- **Not a spam filter.** Phish_Byte targets credential theft, impersonation, and account compromise — not promotional mail.
-- **Not infallible.** F1 0.950 means ~5% of decisions are wrong. Use as one signal in defence-in-depth.
-- **Not production-hardened.** No retry logic, rate limiting, or async SPF. Intended as a detection model, not a production email gateway.
+- **Training data is 15+ years old.** These corpora predate OAuth phishing, QR code lures, redirect chains through legitimate services (Google Docs, Dropbox, OneDrive), and modern adversarial HTML tricks. **Recall on 2020s-era phishing is untested and likely degraded.** Retraining on PhishTank, OpenPhish, and APWG eCrime datasets is the top roadmap priority.
+- **TF-IDF vocabulary is era-locked.** The 50 learned terms reflect 2000s phishing language. Modern phrasing ("access your document," "complete two-step verification") isn't represented.
+- **No adversarial robustness testing has been done.** An attacker aware of the fixed feature set could plausibly craft bypasses. This model has not been red-teamed. Use as one signal in defence-in-depth, not a standalone gate.
+- **F1 0.950 is self-reported** on a held-out split of the training data — not an independently verified or peer-reviewed benchmark.
+- **Not production-hardened** — no retry logic, rate limiting, or async SPF handling.
+- **English-language only.**
 
 ---
 
@@ -314,26 +219,28 @@ Feature extraction is cached — 83K emails extract in ~3 minutes first time, th
 ```
 Phish_Byte/
 ├── phishbyte/
-│   ├── engine.py              # cascading engine, Hub integration
-│   ├── verdict.py             # PhishVerdict dataclass
-│   ├── calibration.py         # ROC-based threshold learning
+│   ├── __init__.py
+│   ├── engine.py               # cascading engine, Hub integration
+│   ├── verdict.py              # PhishVerdict dataclass
+│   ├── calibration.py          # ROC-based threshold learning
 │   ├── extractors/
-│   │   ├── domain.py          # domain + brand + display-name + suspicious pattern
-│   │   ├── urls.py            # URLs, anchors, body urgency (normalized), char-level
-│   │   ├── spf.py             # SPF DNS validation
-│   │   ├── subject.py         # subject line patterns
-│   │   ├── bdi.py             # Body Domain Identification (MCLD, form action, ext ratio)
-│   │   └── tfidf_features.py  # TF-IDF vocabulary fitting + transform
+│   │   ├── __init__.py
+│   │   ├── domain.py           # domain + brand + display-name + suspicious pattern
+│   │   ├── urls.py             # URLs, anchors, body urgency, char-level
+│   │   ├── spf.py              # SPF DNS validation
+│   │   ├── subject.py          # subject line patterns
+│   │   ├── bdi.py              # Body Domain Identification
+│   │   └── tfidf_features.py   # TF-IDF vocabulary fitting + transform
 │   └── model/
-│       ├── mlp.py             # residual MLP (85→360→180×2→90→48→1), Hub mixin
-│       └── weights/           # .gitignored — download from Hub or train locally
-├── train/
-│   ├── acquire_datasets.py    # 6-dataset acquisition + combine
-│   ├── train.py               # training loop with calibrated F1 metric
-│   └── calibrate_thresholds.py
-├── cli.py                     # interactive CLI with Gmail support
-├── eval.py                    # batch evaluation
-├── push_to_hub.py             # one-command Hub deployment
+│       ├── __init__.py
+│       ├── mlp.py              # residual MLP, Hub mixin
+│       └── weights/            # .gitignored — auto-downloaded from Hub
+├── train/                      # training pipeline, dataset acquisition
+├── cli.py                      # interactive CLI with Gmail support
+├── eval.py                     # batch evaluation
+├── push_to_hub.py              # one-command Hub deployment
+├── verify_install.py           # run this before reporting any issue
+├── fix_init_files.py           # repairs missing __init__.py files
 └── requirements.txt
 ```
 
@@ -341,27 +248,25 @@ Phish_Byte/
 
 ## Roadmap
 
-- [x] 6-extractor Layer 1 pipeline (domain, URL, SPF, subject, BDI, TF-IDF)
-- [x] Residual MLP at Layer 2 (254K params, 85 features, from scratch)
-- [x] 6-dataset training corpus (83K emails, balanced)
-- [x] TF-IDF vocabulary learned from training corpus (50 terms)
-- [x] Body Domain Identification (BDI) features
-- [x] ROC-based threshold calibration with Youden J sanity check
-- [x] 85-feature attribution on every verdict
-- [x] GPU support (CUDA 12.8 / Blackwell sm_120)
-- [x] HuggingFace Hub publish
-- [x] Calibrated F1 in training loop (Youden-optimal threshold)
-- [ ] HuggingFace Space demo (try without installing)
-- [ ] PyPI package — `pip install phishbyte`
+- [x] 85-feature, 254K-parameter cascading model
+- [x] 6-dataset training corpus (83K emails)
+- [x] TF-IDF vocabulary + Body Domain Identification features
+- [x] HuggingFace Hub publish with working install
+- [x] `verify_install.py` diagnostic tool
+- [ ] **Retrain on 2020–2024 phishing data** (PhishTank, OpenPhish, APWG eCrime) — top priority
+- [ ] Adversarial robustness test suite + documented known bypasses
+- [ ] Head-to-head benchmark vs DistilBERT on a shared held-out set
+- [ ] HuggingFace Space demo (try in-browser, zero install)
+- [ ] PyPI package (`pip install phishbyte`)
+- [ ] arXiv preprint
 - [ ] URL-only detection mode
-- [ ] Full SHAP attribution (replace input-magnitude proxy)
-- [ ] Layer 3 deep checks (WHOIS, redirect chains, ASN)
-- [ ] Browser extension (Chrome/Firefox)
-- [ ] Multilingual phishing support
+- [ ] Browser extension
 
 ---
 
 ## Citation
+
+No peer-reviewed paper exists yet — an arXiv preprint is planned. Until then, cite the repository:
 
 ```bibtex
 @software{phishbyte2026,
@@ -382,6 +287,8 @@ MIT — see [`LICENSE`](LICENSE).
 ---
 
 <div align="center">
+
+**[🤗 Try it on HuggingFace](https://huggingface.co/SamSec007/phishbyte)** · **[📦 View source](https://github.com/AnonymousSingh-007/Phish_Byte)**
 
 ![Visitor Count](https://komarev.com/ghpvc/?username=AnonymousSingh-007&label=PROFILE+VIEWS&color=00FF88&style=for-the-badge)
 
