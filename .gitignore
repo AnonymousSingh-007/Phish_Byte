@@ -1,32 +1,35 @@
-# Virtual environment
+# ── Virtual environment ───────────────────────────────────────────────────────
 venv/
 .venv/
 env/
 
-# Python cache
+# ── Python cache ──────────────────────────────────────────────────────────────
 __pycache__/
 *.py[cod]
 *.pyo
 *.pyd
 .Python
 
-# Model weights & checkpoints
+# ── Model weights & checkpoints ───────────────────────────────────────────────
+# These live on HuggingFace Hub — download with from_pretrained()
 phishbyte/model/weights/
 *.pt
 *.pth
 *.ckpt
 *.safetensors
 
-# Feature cache — these are large binary files, rebuild with train.py
+# ── Feature extraction cache ──────────────────────────────────────────────────
+# Large binary files — rebuilt automatically by train.py (takes ~3 min)
 train/cache/
 *.pkl
 
-# Training artifacts
+# ── Training artifacts ────────────────────────────────────────────────────────
 train/runs/
 train/logs/
 *.log
 
-# Dataset files — too large for git, download separately
+# ── Dataset files ─────────────────────────────────────────────────────────────
+# Too large for git. Download instructions in train/README.md
 data/
 *.csv
 *.eml
@@ -34,25 +37,31 @@ data/
 *.zip
 *.bz2
 
-# SHAP cache
+# ── Private deployment scripts ────────────────────────────────────────────────
+# These contain or reference your HuggingFace token workflow.
+# Keep local — do not push to public repo.
+push_to_hub.py
+update_hub_metadata.py
+
+# ── SHAP cache ────────────────────────────────────────────────────────────────
 shap_cache/
 
-# OS noise
+# ── OS noise ──────────────────────────────────────────────────────────────────
 .DS_Store
 Thumbs.db
 desktop.ini
 
-# IDE
+# ── IDE ───────────────────────────────────────────────────────────────────────
 .vscode/
 .idea/
 *.suo
 *.user
 
-# Build
+# ── Build / packaging ─────────────────────────────────────────────────────────
 dist/
 build/
 *.egg-info/
 
-# Jupyter
+# ── Jupyter ───────────────────────────────────────────────────────────────────
 .ipynb_checkpoints/
 *.ipynb
