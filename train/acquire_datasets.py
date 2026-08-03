@@ -1,9 +1,15 @@
 """
-train/acquire_datasets.py — v4
-Fixes:
-  - Nigerian_Fraud.csv (was looking for Nigerian.csv)
-  - Adds --with-bonus flag to include phishing_email.csv (82K rows)
-  - Text key for phishing_email.csv is 'text_combined' not 'body'
+train/acquire_datasets.py — v5
+
+Adds HuggingFace dataset loading alongside existing Kaggle CSVs.
+New: farshad72/spam_email (83K rows, label + text columns)
+New: puyang2025/seven-phishing-email-datasets (203K, unified 7-source)
+
+Usage:
+    python train/acquire_datasets.py --all            # Kaggle CSVs only
+    python train/acquire_datasets.py --hf             # HuggingFace datasets only
+    python train/acquire_datasets.py --all --hf       # everything combined
+    python train/acquire_datasets.py --check-existing # inspect what's in data/raw/
 """
 
 import os, sys, argparse, re, tarfile, requests
@@ -43,7 +49,6 @@ def _load_csv(path, source, text_keys, label_keys,
     if not path.exists():
         print(f"  [SKIP] {path.name} not found")
         return pd.DataFrame()
-
     size_mb = path.stat().st_size / 1_048_576
     print(f"  Loading {path.name}  ({size_mb:.1f} MB)...")
     try:
@@ -65,14 +70,14 @@ def _load_csv(path, source, text_keys, label_keys,
 
     rows = []
     for _, row in df.iterrows():
-        body = _safe(row.get(text_col, ""))
+        body = _safe(row.get(text_col,""))
         if not body or len(body) < 10: continue
         parts = []
         if send_col and _safe(row.get(send_col,"")): parts.append(f"From: {_safe(row[send_col])}")
         if subj_col and _safe(row.get(subj_col,"")): parts.append(f"Subject: {_safe(row[subj_col])}")
         if parts: parts.append("")
         parts.append(body)
-        text = _clean("\n".join(parts))
+        text  = _clean("\n".join(parts))
         label = _label_from_str(_safe(row.get(label_col,""))) if label_col else default_label
         if label is None: continue
         rows.append({"email_text": text, "label": label, "source": source})
@@ -83,6 +88,8 @@ def _load_csv(path, source, text_keys, label_keys,
     print(f"    → {len(result):,} rows  ({n_phish:,} phish / {len(result)-n_phish:,} legit)")
     return result
 
+
+# ── Kaggle CSV loaders ────────────────────────────────────────────────────────
 
 def load_ceas():
     return _load_csv(RAW/"CEAS_08.csv", "ceas2008",
@@ -103,14 +110,11 @@ def load_nazario():
         default_label=1)
 
 def load_nigerian():
-    # FIX: try Nigerian_Fraud.csv first, then Nigerian.csv
     path = RAW/"Nigerian_Fraud.csv"
-    if not path.exists():
-        path = RAW/"Nigerian.csv"
+    if not path.exists(): path = RAW/"Nigerian.csv"
     return _load_csv(path, "nigerian",
         ["body","text","message","mail","email"], ["label","spam","class"],
-        default_label=1,
-        subject_key="subject", sender_key="sender")
+        default_label=1, subject_key="subject", sender_key="sender")
 
 def load_spamassassin_kaggle():
     return _load_csv(RAW/"SpamAssasin.csv", "spamassassin_kaggle",
@@ -123,18 +127,76 @@ def load_spamassassin_apache():
     return _load_csv(path, "spamassassin_apache",
         ["email_text","body","text","message"], ["label","spam","class"])
 
-def load_bonus_phishing_email():
+
+# ── HuggingFace dataset loaders ───────────────────────────────────────────────
+
+def load_hf_farshad() -> pd.DataFrame:
     """
-    phishing_email.csv — 82K pre-merged rows, text_combined column.
-    Adds ~43K phishing + 40K legit after dedup with the others.
-    Use --with-bonus to include.
+    farshad72/spam_email — 83,448 rows
+    Columns: label (0/1), text (email body)
+    Mix of Enron legit, pharmacy spam, watch replicas, stock scams.
+    Has modern-ish notification-style legitimate emails.
     """
-    return _load_csv(RAW/"phishing_email.csv", "kaggle_merged",
-        ["text_combined","body","text","message","email_text"],
-        ["label","spam","class"])
+    print(f"\n  Loading farshad72/spam_email from HuggingFace...")
+    try:
+        from datasets import load_dataset
+    except ImportError:
+        print(f"  [ERROR] pip install datasets")
+        return pd.DataFrame()
+
+    try:
+        ds = load_dataset("farshad72/spam_email", split="train")
+        rows = []
+        for item in ds:
+            text  = _clean(_safe(item.get("text","")))
+            label = item.get("label", None)
+            if not text or len(text) < 10 or label is None: continue
+            rows.append({"email_text": text, "label": int(label), "source": "farshad72"})
+        result = pd.DataFrame(rows).dropna()
+        result = result[result["email_text"].str.len() > 30] if not result.empty else result
+        n_phish = int(result["label"].sum()) if not result.empty else 0
+        print(f"    → {len(result):,} rows  ({n_phish:,} phish / {len(result)-n_phish:,} legit)")
+        return result
+    except Exception as e:
+        print(f"  [ERROR] Failed to load farshad72/spam_email: {e}")
+        return pd.DataFrame()
 
 
-def download_spamassassin():
+def load_hf_puyang() -> pd.DataFrame:
+    """
+    puyang2025/seven-phishing-email-datasets — 203,017 rows
+    Unified 7-source corpus: Assassin, CEAS-08, Enron, Ling, TREC-05/06/07
+    Will heavily overlap with our Kaggle CSVs — dedup handles it.
+    """
+    print(f"\n  Loading puyang2025/seven-phishing-email-datasets from HuggingFace...")
+    try:
+        from datasets import load_dataset
+    except ImportError:
+        print(f"  [ERROR] pip install datasets")
+        return pd.DataFrame()
+
+    try:
+        ds = load_dataset("puyang2025/seven-phishing-email-datasets", split="train")
+        rows = []
+        for item in ds:
+            text  = _clean(_safe(item.get("text", item.get("body", ""))))
+            label = item.get("label", None)
+            if not text or len(text) < 10 or label is None: continue
+            source = f"puyang_{_safe(item.get('dataset_name','unknown'))}"
+            rows.append({"email_text": text, "label": int(label), "source": source})
+        result = pd.DataFrame(rows).dropna()
+        result = result[result["email_text"].str.len() > 30] if not result.empty else result
+        n_phish = int(result["label"].sum()) if not result.empty else 0
+        print(f"    → {len(result):,} rows  ({n_phish:,} phish / {len(result)-n_phish:,} legit)")
+        return result
+    except Exception as e:
+        print(f"  [ERROR] Failed to load puyang2025: {e}")
+        return pd.DataFrame()
+
+
+# ── SpamAssassin auto-download ────────────────────────────────────────────────
+
+def download_spamassassin() -> pd.DataFrame:
     ARCHIVES = [
         ("20030228_easy_ham.tar.bz2", 0),
         ("20030228_hard_ham.tar.bz2", 0),
@@ -174,10 +236,11 @@ def download_spamassassin():
     if not df.empty:
         out = COMB/"spamassassin.csv"
         df.to_csv(out, index=False)
-        print(f"  SpamAssassin (Apache): {len(df):,} rows  ({int(df.label.sum()):,} spam)")
-        print(f"  Saved → {out}")
+        print(f"  SpamAssassin: {len(df):,} rows — saved → {out}")
     return df
 
+
+# ── Combine & save ────────────────────────────────────────────────────────────
 
 def combine_and_save(dfs: list) -> pd.DataFrame:
     valid = [d for d in dfs if d is not None and not d.empty]
@@ -189,23 +252,23 @@ def combine_and_save(dfs: list) -> pd.DataFrame:
     combined["_key"] = combined["email_text"].str[:200]
     combined = combined.drop_duplicates(subset=["_key"]).drop(columns=["_key"])
     combined = combined[combined["email_text"].str.len() > 50]
-    after    = len(combined)
     combined = combined.sample(frac=1, random_state=42).reset_index(drop=True)
+    after    = len(combined)
 
     n_phish = int(combined["label"].sum())
     n_legit = len(combined) - n_phish
 
     print(f"\n{'═'*60}")
-    print(f"  COMBINED CORPUS — PHISH_BYTE v3")
+    print(f"  COMBINED CORPUS")
     print(f"{'═'*60}")
-    print(f"  Before dedup  : {before:,}")
-    print(f"  After dedup   : {after:,}")
-    print(f"  Phishing      : {n_phish:,}  ({n_phish/after:.1%})")
-    print(f"  Legitimate    : {n_legit:,}  ({n_legit/after:.1%})")
+    print(f"  Before dedup : {before:,}")
+    print(f"  After dedup  : {after:,}")
+    print(f"  Phishing     : {n_phish:,}  ({n_phish/after:.1%})")
+    print(f"  Legitimate   : {n_legit:,}  ({n_legit/after:.1%})")
     print(f"\n  Source breakdown:")
     for src, grp in combined.groupby("source"):
         p = int(grp["label"].sum())
-        print(f"    {src:<30} {len(grp):>8,}  ({p:,} phish / {len(grp)-p:,} legit)")
+        print(f"    {src:<35} {len(grp):>8,}  ({p:,} phish / {len(grp)-p:,} legit)")
 
     out = COMB / "phishbyte_v3_corpus.csv"
     combined[["email_text","label","source"]].to_csv(out, index=False)
@@ -216,18 +279,20 @@ def combine_and_save(dfs: list) -> pd.DataFrame:
     return combined
 
 
+# ── Main ──────────────────────────────────────────────────────────────────────
+
 def main():
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(description="PhishByte dataset acquisition")
     parser.add_argument("--check-existing", action="store_true")
     parser.add_argument("--spamassassin",   action="store_true")
-    parser.add_argument("--all",            action="store_true",
-                        help="Combine all 6 core datasets")
-    parser.add_argument("--with-bonus",     action="store_true",
-                        help="Also include phishing_email.csv (+82K rows, more dedup)")
+    parser.add_argument("--all",  action="store_true",
+                        help="Load all Kaggle CSVs from data/raw/")
+    parser.add_argument("--hf",   action="store_true",
+                        help="Load HuggingFace datasets (requires: pip install datasets)")
     args = parser.parse_args()
 
     print(f"\n{'═'*60}")
-    print(f"  PHISH_BYTE v3 — DATASET ACQUISITION")
+    print(f"  PHISH_BYTE — DATASET ACQUISITION")
     print(f"{'═'*60}")
 
     if args.check_existing:
@@ -246,27 +311,37 @@ def main():
         download_spamassassin()
         return
 
-    if args.all or args.with_bonus:
-        print("\n  Loading datasets...\n")
-        dfs = [
+    dfs = []
+
+    if args.all:
+        print("\n  Loading Kaggle CSVs from data/raw/...\n")
+        dfs += [
             load_ceas(),
             load_enron(),
             load_ling(),
             load_nazario(),
-            load_nigerian(),        # FIX: now finds Nigerian_Fraud.csv
+            load_nigerian(),
             load_spamassassin_kaggle(),
             load_spamassassin_apache(),
         ]
-        if args.with_bonus:
-            print("\n  Loading bonus phishing_email.csv (82K rows)...")
-            dfs.append(load_bonus_phishing_email())
-        combine_and_save(dfs)
+
+    if args.hf:
+        print("\n  Loading HuggingFace datasets...")
+        print("  (requires: pip install datasets)")
+        dfs += [
+            load_hf_farshad(),
+            load_hf_puyang(),
+        ]
+
+    if not dfs:
+        print("  Use --all, --hf, or both. Examples:")
+        print("  python train/acquire_datasets.py --all")
+        print("  python train/acquire_datasets.py --hf")
+        print("  python train/acquire_datasets.py --all --hf")
         return
 
-    print("  --check-existing   see what files are in data/raw/")
-    print("  --spamassassin     auto-download from Apache (no login)")
-    print("  --all              combine 6 core datasets (~83K emails)")
-    print("  --with-bonus       also include phishing_email.csv (~150K total after dedup)")
+    combine_and_save(dfs)
+
 
 if __name__ == "__main__":
     main()
