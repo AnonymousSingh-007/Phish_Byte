@@ -1,9 +1,10 @@
 """
-eval.py — v2
-Batch evaluate the engine on CEAS or combined corpus.
-Works with v7 pipeline (engine handles all extractor calls internally).
+eval.py — v3
+Batch evaluate — works with v8 pipeline (engine handles all extractors internally).
+No changes needed from v2 except comment update, since engine.analyze()
+already wires domain/url/spf/subject/bdi/lexical/cross_signal/tfidf together.
 """
-import os, sys, argparse, random, time
+import os, sys, argparse, time
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, ROOT)
@@ -19,13 +20,12 @@ def main():
                                              "phishbyte_v3_corpus.csv"))
     args = parser.parse_args()
 
-    # SPF skip for eval on historical data
     os.environ["PHISHBYTE_SKIP_SPF"] = "1"
 
     from phishbyte.engine import PhishByteEngine
 
     print(f"\n{'═'*60}")
-    print(f"  PHISH_BYTE — BATCH EVALUATION")
+    print(f"  PHISH_BYTE v8 — BATCH EVALUATION")
     print(f"{'═'*60}")
     print(f"  Samples   : {args.n:,}")
     print(f"  Force MLP : {args.force_mlp}")
@@ -33,24 +33,13 @@ def main():
 
     engine = PhishByteEngine(force_mlp=args.force_mlp)
 
-    # Load evaluation samples
     if os.path.exists(args.data):
         import pandas as pd
         df      = pd.read_csv(args.data).dropna()
         df      = df.sample(n=min(args.n, len(df)), random_state=args.seed)
-        samples = list(zip(df["email_text"].tolist(),
-                           df["label"].astype(int).tolist()))
+        samples = list(zip(df["email_text"].tolist(), df["label"].astype(int).tolist()))
     else:
-        print(f"  [WARN] Data not found at {args.data}")
-        print(f"  Using CEAS-2008 fallback...")
-        ceas = os.path.join(ROOT, "data", "ceas2008_phishbyte.csv")
-        if not os.path.exists(ceas):
-            print(f"  [ERROR] No evaluation data found."); sys.exit(1)
-        import pandas as pd
-        df      = pd.read_csv(ceas).dropna()
-        df      = df.sample(n=min(args.n, len(df)), random_state=args.seed)
-        samples = list(zip(df["email_text"].tolist(),
-                           df["label"].astype(int).tolist()))
+        print(f"  [ERROR] Data not found at {args.data}"); sys.exit(1)
 
     tp = fp = tn = fn = 0
     layer_used  = {}
