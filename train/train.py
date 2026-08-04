@@ -1,10 +1,12 @@
 """
-train/train.py — v7
-Key changes:
-  1. Fits TF-IDF vocab on training set first, saves to weights dir
-  2. Extracts BDI features in pipeline
-  3. Training loop F1 uses Youden-optimal threshold (not naive 0.5)
-  4. Progress bar every 2000 samples
+train/train.py — v8
+
+Adds:
+  - Full 6-group extraction (domain, url, spf, subject, bdi, lexical×2, cross_signal, tfidf)
+  - BCEWithLogitsLoss training (forward_logits, not forward)
+  - Post-training temperature calibration pass — fits self.temperature
+    on validation set by minimizing negative log-likelihood, so the
+    sigmoid output is a genuinely calibrated probability afterward.
 """
 import os, sys, argparse, random, time, pickle, hashlib
 from typing import List, Tuple
@@ -30,7 +32,7 @@ VAL_SPLIT, TEST_SPLIT, PATIENCE = 0.15, 0.10, 8
 TFIDF_N = 50
 
 
-def _fingerprint(samples, version="v7"):
+def _fingerprint(samples, version="v8"):
     h = hashlib.md5()
     for raw, label in samples:
         h.update(raw[:100].encode("utf-8", errors="ignore"))
@@ -40,17 +42,19 @@ def _fingerprint(samples, version="v7"):
 
 
 def extract_features_with_cache(samples, rebuild=False):
-    from phishbyte.extractors.domain  import score_domain
-    from phishbyte.extractors.urls    import score_urls
-    from phishbyte.extractors.spf     import score_spf
-    from phishbyte.extractors.subject import score_subject
-    from phishbyte.extractors.bdi     import score_bdi
+    from phishbyte.extractors.domain         import score_domain
+    from phishbyte.extractors.urls           import score_urls
+    from phishbyte.extractors.spf            import score_spf
+    from phishbyte.extractors.subject        import score_subject
+    from phishbyte.extractors.bdi            import score_bdi
+    from phishbyte.extractors.lexical        import score_lexical
+    from phishbyte.extractors.cross_signal   import score_cross_signal
     from phishbyte.extractors.tfidf_features import TFIDFVocab
     from phishbyte.model.mlp import build_feature_vector
 
     os.makedirs(CACHE_DIR, exist_ok=True)
     fp         = _fingerprint(samples)
-    cache_path = os.path.join(CACHE_DIR, f"features_v7_{fp}.pkl")
+    cache_path = os.path.join(CACHE_DIR, f"features_v8_{fp}.pkl")
 
     if os.path.exists(cache_path) and not rebuild:
         print(f"  Cache HIT  → {cache_path}")
@@ -62,7 +66,6 @@ def extract_features_with_cache(samples, rebuild=False):
     print(f"  Cache MISS → {len(samples):,} emails")
     print(f"  SPF: {'SKIPPED' if os.environ.get('PHISHBYTE_SKIP_SPF')=='1' else 'LIVE'}")
 
-    # ── Step 1: Fit TF-IDF vocab on training split ──────────────────────────
     print(f"\n  Step 1 — Fitting TF-IDF vocabulary ({TFIDF_N} terms)...")
     raw_texts = [r for r, _ in samples]
     lbls      = [l for _, l in samples]
@@ -75,8 +78,7 @@ def extract_features_with_cache(samples, rebuild=False):
         os.makedirs(WEIGHTS_DIR, exist_ok=True)
         vocab.save(VOCAB_PATH)
 
-    # ── Step 2: Extract all features ────────────────────────────────────────
-    print(f"\n  Step 2 — Extracting all features...")
+    print(f"\n  Step 2 — Extracting all feature groups (7 modules per email)...")
     features, labels = [], []
     t0, skipped = time.time(), 0
 
@@ -87,8 +89,14 @@ def extract_features_with_cache(samples, rebuild=False):
             sp  = score_spf(raw)
             sub = score_subject(raw)
             bdi = score_bdi(raw)
-            tfi = vocab.transform(raw)
-            features.append(build_feature_vector(d, u, sp, sub, bdi, tfi))
+            sender_lex = score_lexical(d.get("from_domain") or "")
+            mcld_lex   = bdi.get("mcld_lexical") or {
+                k: 0.0 for k in ["digit_run_score","hyphen_run_score","entropy_score",
+                                 "vowel_ratio_anomaly","brand_typosquat_score","domain_length_score"]
+            }
+            cross = score_cross_signal(d, u, sp, bdi)
+            tfi   = vocab.transform(raw)
+            features.append(build_feature_vector(d, u, sp, sub, bdi, cross, sender_lex, mcld_lex, tfi))
             labels.append(torch.tensor([float(label)], dtype=torch.float32))
         except Exception:
             skipped += 1
@@ -96,7 +104,7 @@ def extract_features_with_cache(samples, rebuild=False):
             el   = time.time()-t0
             rate = (i+1)/el
             eta  = (len(samples)-(i+1))/rate
-            print(f"    [{i+1:>6}/{len(samples):>6}]  {el:>5.0f}s  {rate:>6.0f}/s  ETA {eta:>4.0f}s")
+            print(f"    [{i+1:>7}/{len(samples):>7}]  {el:>5.0f}s  {rate:>6.0f}/s  ETA {eta:>4.0f}s")
 
     total_time = time.time()-t0
     print(f"  Done. {len(features):,} valid, {skipped} skipped. ({total_time:.1f}s)")
@@ -109,7 +117,6 @@ def extract_features_with_cache(samples, rebuild=False):
 
 
 def _optimal_f1(scores, labels_np):
-    """Find F1 at Youden-optimal threshold — replaces naive 0.5 cutoff."""
     best_f1, best_t = 0.0, 0.5
     for t in np.linspace(0.1, 0.9, 81):
         preds = (scores >= t).astype(int)
@@ -130,34 +137,92 @@ class FeatureDataset(Dataset):
 
 
 def train_epoch(model, loader, opt, crit, dev):
+    """Uses forward_logits() + BCEWithLogitsLoss — no sigmoid applied yet."""
     model.train()
     tl, c, t = 0., 0, 0
     for xb, yb in loader:
         xb, yb = xb.to(dev), yb.to(dev)
-        opt.zero_grad(); p=model(xb); loss=crit(p,yb)
+        opt.zero_grad()
+        logits = model.forward_logits(xb)
+        loss = crit(logits, yb)
         loss.backward(); opt.step()
-        tl+=loss.item()*len(xb)
-        c+=((p>=0.5).float()==yb).sum().item(); t+=len(xb)
+        tl += loss.item()*len(xb)
+        preds = (torch.sigmoid(logits) >= 0.5).float()
+        c += (preds==yb).sum().item(); t += len(xb)
     return tl/t, c/t
 
 
 @torch.no_grad()
-def eval_epoch(model, loader, crit, dev):
+def eval_epoch(model, loader, crit, dev, use_calibrated=False):
+    """
+    use_calibrated=False: raw logits + BCEWithLogitsLoss (training-time eval)
+    use_calibrated=True:  temperature-scaled forward() output (final eval)
+    """
     model.eval()
     tl, c, t = 0., 0, 0
     all_scores, all_labels = [], []
     for xb, yb in loader:
         xb, yb = xb.to(dev), yb.to(dev)
-        p=model(xb); loss=crit(p,yb)
-        tl+=loss.item()*len(xb)
-        pred=(p>=0.5).float()
-        c+=(pred==yb).sum().item(); t+=len(xb)
-        all_scores.extend(p.cpu().numpy().flatten())
+        if use_calibrated:
+            probs = model(xb)
+            loss = nn.functional.binary_cross_entropy(probs, yb)
+        else:
+            logits = model.forward_logits(xb)
+            loss = crit(logits, yb)
+            probs = torch.sigmoid(logits)
+        tl += loss.item()*len(xb)
+        pred = (probs>=0.5).float()
+        c += (pred==yb).sum().item(); t += len(xb)
+        all_scores.extend(probs.cpu().numpy().flatten())
         all_labels.extend(yb.cpu().numpy().flatten())
     scores_np = np.array(all_scores)
     labels_np = np.array(all_labels)
     f1, threshold = _optimal_f1(scores_np, labels_np)
     return tl/t, c/t, f1, threshold
+
+
+def calibrate_temperature(model, loader, dev, lr=0.01, n_steps=100):
+    """
+    Post-training temperature calibration.
+    Freezes all weights, fits ONLY self.temperature to minimize NLL on
+    the validation set. This is Platt scaling adapted for a single
+    learned temperature — standard technique for calibrating neural
+    network confidence outputs (Guo et al. 2017).
+    """
+    print(f"\n  Calibrating temperature on validation set...")
+    model.eval()
+    for p in model.parameters():
+        p.requires_grad = False
+    model.temperature.requires_grad = True
+
+    optimizer = torch.optim.LBFGS([model.temperature], lr=lr, max_iter=n_steps)
+
+    all_logits, all_labels = [], []
+    with torch.no_grad():
+        for xb, yb in loader:
+            xb, yb = xb.to(dev), yb.to(dev)
+            all_logits.append(model.forward_logits(xb))
+            all_labels.append(yb)
+    logits_cat = torch.cat(all_logits)
+    labels_cat = torch.cat(all_labels)
+
+    def closure():
+        optimizer.zero_grad()
+        loss = nn.functional.binary_cross_entropy_with_logits(
+            logits_cat / model.temperature.clamp(min=0.05), labels_cat
+        )
+        loss.backward()
+        return loss
+
+    optimizer.step(closure)
+
+    for p in model.parameters():
+        p.requires_grad = True
+
+    final_temp = model.temperature.item()
+    print(f"  Learned temperature: {final_temp:.4f}")
+    print(f"  (T=1.0 means no adjustment; T>1 softens overconfidence)")
+    return final_temp
 
 
 def main():
@@ -177,7 +242,7 @@ def main():
     dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     print(f"\n{'═'*60}")
-    print(f"  PHISH_BYTE v7 — MLP TRAINING")
+    print(f"  PHISH_BYTE v8 — MLP TRAINING")
     print(f"{'═'*60}")
     if dev.type == "cuda":
         print(f"  Device   : GPU — {torch.cuda.get_device_name(0)}")
@@ -185,7 +250,7 @@ def main():
         print(f"             {vram:.1f} GB VRAM · {torch.__version__}")
     else:
         print(f"  Device   : CPU")
-    print(f"  Features : {INPUT_DIM} (35 rule + 50 TF-IDF)")
+    print(f"  Features : {INPUT_DIM} (54 rule/lexical/cross-signal + 50 TF-IDF)")
     print(f"  Skip SPF : {args.skip_spf}")
 
     if args.data and os.path.exists(args.data):
@@ -221,13 +286,13 @@ def main():
     model = PhishByteMLPLayer(input_dim=INPUT_DIM).to(dev)
     opt   = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=WEIGHT_DECAY)
     sched = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, mode="min", factor=0.5, patience=3)
-    crit  = nn.BCELoss()
+    crit  = nn.BCEWithLogitsLoss()
 
     params = sum(p.numel() for p in model.parameters())
     print(f"\n  Model params : {params:,}")
-    print(f"  Architecture : {INPUT_DIM}→360→180(×2ResBlock)→90→48→1")
-    print(f"\n  NOTE: F1 column uses Youden-optimal threshold (not 0.5)")
-    print(f"  This is the REAL F1 — calibrated during training.")
+    print(f"  Architecture : {INPUT_DIM}→620→310(×2ResBlock)→155→76→1")
+    print(f"\n  NOTE: F1 uses Youden-optimal threshold. Training uses raw logits;")
+    print(f"  temperature calibration runs AFTER training converges.")
     print(f"\n{'─'*60}")
     print(f"  {'Ep':>3}  {'TrLoss':>8}  {'TrAcc':>7}  {'VaLoss':>8}  {'VaF1':>7}  {'VaThresh':>9}")
     print(f"{'─'*60}")
@@ -238,7 +303,7 @@ def main():
 
     for ep in range(1, args.epochs+1):
         tl, ta = train_epoch(model, tr_l, opt, crit, dev)
-        vl, va_, vf1, vt = eval_epoch(model, va_l, crit, dev)
+        vl, va_, vf1, vt = eval_epoch(model, va_l, crit, dev, use_calibrated=False)
         sched.step(vl)
         print(f"  {ep:>3}  {tl:>8.4f}  {ta:>6.1%}  {vl:>8.4f}  {vf1:>6.3f}  {vt:>9.3f}")
         if vl < best:
@@ -251,11 +316,19 @@ def main():
                 break
 
     train_time = time.time()-t0
+
     print(f"\n{'═'*60}")
-    print(f"  FINAL TEST EVALUATION")
+    print(f"  TEMPERATURE CALIBRATION")
     print(f"{'═'*60}")
     model.load_state_dict(torch.load(WEIGHTS_PATH, map_location=dev, weights_only=True))
-    te_loss, te_acc, te_f1, te_thresh = eval_epoch(model, te_l, crit, dev)
+    calibrate_temperature(model, va_l, dev)
+    torch.save(model.state_dict(), WEIGHTS_PATH)
+    print(f"  Weights re-saved with calibrated temperature.")
+
+    print(f"\n{'═'*60}")
+    print(f"  FINAL TEST EVALUATION (calibrated)")
+    print(f"{'═'*60}")
+    te_loss, te_acc, te_f1, te_thresh = eval_epoch(model, te_l, crit, dev, use_calibrated=True)
     print(f"  Test Loss      : {te_loss:.4f}")
     print(f"  Test Accuracy  : {te_acc:.2%}")
     print(f"  Test F1        : {te_f1:.4f}  (at threshold {te_thresh:.3f})")
