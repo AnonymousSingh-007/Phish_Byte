@@ -1,6 +1,8 @@
 """
-train/calibrate_thresholds.py — v4
-Updated for v7 pipeline: 6-argument build_feature_vector (domain, url, spf, subject, bdi, tfidf)
+train/calibrate_thresholds.py — v5
+Updated for v8 pipeline: 9-argument build_feature_vector
+(domain, url, spf, subject, bdi, cross_signal, sender_lex, mcld_lex, tfidf)
+Uses model.forward() for calibrated probabilities (temperature applied).
 """
 import os, sys, argparse, random
 import numpy as np
@@ -27,19 +29,20 @@ def main():
     from phishbyte.extractors.spf            import score_spf
     from phishbyte.extractors.subject        import score_subject
     from phishbyte.extractors.bdi            import score_bdi
+    from phishbyte.extractors.lexical        import score_lexical
+    from phishbyte.extractors.cross_signal   import score_cross_signal
     from phishbyte.extractors.tfidf_features import TFIDFVocab
     from phishbyte.model.mlp                 import PhishByteMLPLayer, build_feature_vector
     from phishbyte.calibration               import calibrate_layer, save_thresholds, ThresholdConfig
 
-    WEIGHTS  = os.path.join(ROOT, "phishbyte", "model", "weights", "phishbyte_mlp.pt")
-    VOCAB    = os.path.join(ROOT, "phishbyte", "model", "weights", "tfidf_vocab.json")
-    OUTPATH  = os.path.join(ROOT, "phishbyte", "model", "weights", "thresholds.json")
+    WEIGHTS = os.path.join(ROOT, "phishbyte", "model", "weights", "phishbyte_mlp.pt")
+    VOCAB   = os.path.join(ROOT, "phishbyte", "model", "weights", "tfidf_vocab.json")
+    OUTPATH = os.path.join(ROOT, "phishbyte", "model", "weights", "thresholds.json")
 
     print(f"\n{'═'*52}")
-    print(f"  PHISH_BYTE — THRESHOLD CALIBRATION (v4)")
+    print(f"  PHISH_BYTE — THRESHOLD CALIBRATION (v5)")
     print(f"{'═'*52}")
 
-    # Load data
     if args.data and os.path.exists(args.data):
         import pandas as pd
         df = pd.read_csv(args.data).dropna()
@@ -56,18 +59,17 @@ def main():
         samples = generate_dataset(n_phish=200, n_legit=200)
         print(f"  Source: synthetic ({len(samples)} samples)")
 
-    # Load model
     if os.path.exists(WEIGHTS):
         model = PhishByteMLPLayer()
         model.load_state_dict(torch.load(WEIGHTS, map_location="cpu", weights_only=True))
         model.eval()
         has_model = True
-        print(f"  MLP loaded")
+        temp = model.temperature.item()
+        print(f"  MLP loaded (temperature={temp:.3f})")
     else:
         has_model = False
         print(f"  No MLP weights — Layer 1 only")
 
-    # Load TF-IDF vocab
     if os.path.exists(VOCAB):
         vocab = TFIDFVocab.load(VOCAB)
         print(f"  TF-IDF vocab loaded ({len(vocab.vocab)} terms)")
@@ -75,7 +77,6 @@ def main():
         vocab = None
         print(f"  No TF-IDF vocab — TF-IDF features will be zero")
 
-    # Extract features
     l1_scores, l2_scores, labels = [], [], []
     skipped = 0
     for raw, label in samples:
@@ -85,20 +86,25 @@ def main():
             s   = score_spf(raw)
             sub = score_subject(raw)
             bdi = score_bdi(raw)
-            tfi = vocab.transform(raw) if vocab else \
-                  {f"tfidf_pad_{i}": 0.0 for i in range(50)}
+            sender_lex = score_lexical(d.get("from_domain") or "")
+            mcld_lex   = bdi.get("mcld_lexical") or {
+                k: 0.0 for k in ["digit_run_score","hyphen_run_score","entropy_score",
+                                 "vowel_ratio_anomaly","brand_typosquat_score","domain_length_score"]
+            }
+            cross = score_cross_signal(d, u, s, bdi)
+            tfi = vocab.transform(raw) if vocab else {f"tfidf_pad_{i}": 0.0 for i in range(50)}
 
             l1 = min(1.0,
-                d["score"]*0.25 + u["score"]*0.25 +
-                sub["score"]*0.20 + bdi["score"]*0.20 + s["score"]*0.10
+                d["score"]*0.20 + u["score"]*0.20 + sub["score"]*0.15 +
+                bdi["score"]*0.20 + s["score"]*0.10 + cross["score"]*0.15
             )
             l1_scores.append(l1)
             labels.append(label)
 
             if has_model:
-                fvec = build_feature_vector(d, u, s, sub, bdi, tfi)
+                fvec = build_feature_vector(d, u, s, sub, bdi, cross, sender_lex, mcld_lex, tfi)
                 l2_scores.append(model.predict_proba(fvec))
-        except Exception as e:
+        except Exception:
             skipped += 1
             continue
 
@@ -134,7 +140,7 @@ def main():
 
     if has_model:
         l2 = np.array(l2_scores)
-        print(f"\n  L2 score distribution:")
+        print(f"\n  L2 score distribution (calibrated, temperature={temp:.3f}):")
         print(f"    phish : mean {l2[labels_arr==1].mean():.3f}  std {l2[labels_arr==1].std():.3f}")
         print(f"    legit : mean {l2[labels_arr==0].mean():.3f}  std {l2[labels_arr==0].std():.3f}")
 
