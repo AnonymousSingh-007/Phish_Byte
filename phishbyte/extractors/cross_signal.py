@@ -1,16 +1,14 @@
 """
-phishbyte/extractors/cross_signal.py — NEW MODULE
+phishbyte/extractors/cross_signal.py — v2
 
-This is the layer that was missing: features computed AFTER all six base
-extractors run, capturing interactions between them that no single
-extractor can see alone.
+Key change: trust_consistency_score now uses DMARC pass + DKIM alignment
+as the primary trust anchor instead of raw SPF result.
+This fixes false positives on ESP-relayed legitimate email.
 
-This directly targets the GitHub false-positive pattern: SPF passes +
-consistent root domains + high link count to ONE legitimate domain should
-actively DISCOUNT the phishing signal, not sit next to it unexplained.
-
-Called once per email, after domain/urls/spf/subject/bdi have all run.
-Takes their output dicts as input — computes nothing from raw email text.
+DMARC alignment is the correct metric because:
+  - It was designed to handle third-party senders (Marketo, Mailgun, etc.)
+  - It validates the From domain (what the user sees) not the envelope sender
+  - p=REJECT means the domain owner will not legitimate mail fail DMARC
 """
 from typing import Dict, Any
 
@@ -22,53 +20,49 @@ def score_cross_signal(
     bdi_result:    Dict[str, Any],
 ) -> Dict[str, Any]:
     """
-    Cross-extractor interaction features.
+    Cross-extractor interaction features — v2.
 
     Features (5):
-        trust_consistency_score  — SPF pass + matching root domains across
-                                    From/Reply-To/Return-Path + MCLD matches
-                                    sender = strong legitimacy signal
-        spf_pass_url_discount    — if SPF passes, high link density / BDI
-                                    scores are discounted (legitimate senders
-                                    with SPF can still send link-heavy mail)
-        multi_signal_phish_score — how many of {domain, url, bdi, subject}
-                                    independently flagged phishing >0.5.
-                                    Agreement across modules is much stronger
-                                    evidence than one module firing alone.
-        domain_bdi_agreement     — domain mismatch AND mcld_mismatch fire
-                                    together = compounding evidence, not
-                                    just additive
-        lexical_brand_confusion  — sender domain lexically resembles a brand
-                                    (from BDI's mcld_lexical) AND domain
-                                    extractor's brand_impersonation both fire
+        trust_consistency_score  — DMARC pass + DKIM aligned + domain consistency
+                                   + MCLD matches sender = legitimacy signal
+        spf_pass_url_discount    — if auth aligns, discount link density penalty
+        multi_signal_phish_score — how many independent modules flag >0.5
+        domain_bdi_agreement     — domain mismatch AND mcld_mismatch compound
+        lexical_brand_confusion  — typosquat + brand impersonation compound
     """
-    spf_passed = spf_result.get("spf_result") == "pass"
+    f_spf = spf_result.get("features", {})
 
-    # ── Trust consistency ─────────────────────────────────────────────────────
-    # High when: SPF passes, domains are internally consistent, MCLD matches sender
-    domains_match  = domain_result.get("domains_match", False)
-    mcld_mismatch  = bdi_result["features"].get("mcld_mismatch", 0.0)
+    # ── Trust consistency — now DMARC/DKIM anchored ──────────────────────────
+    dmarc_pass       = f_spf.get("dmarc_pass", 0.0)
+    dkim_aligned     = f_spf.get("dkim_aligned", 0.0)
+    auth_align_score = f_spf.get("auth_alignment_score", 1.0)  # low=trusted
+    domains_match    = domain_result.get("domains_match", False)
+    mcld_mismatch    = bdi_result["features"].get("mcld_mismatch", 0.0)
+
     trust_consistency_score = 0.0
-    if spf_passed:
-        trust_consistency_score += 0.5
+    # DMARC pass is now the primary trust anchor (was raw SPF before)
+    if dmarc_pass >= 1.0:
+        trust_consistency_score += 0.45
+    # DKIM aligned to From domain adds structural trust
+    if dkim_aligned >= 1.0:
+        trust_consistency_score += 0.25
+    # Header domain consistency
     if domains_match:
-        trust_consistency_score += 0.3
+        trust_consistency_score += 0.15
+    # BDI: most-common-link-domain matches sender
     if mcld_mismatch < 0.5:
-        trust_consistency_score += 0.2
+        trust_consistency_score += 0.15
     trust_consistency_score = min(1.0, trust_consistency_score)
 
-    # ── SPF-pass discount ─────────────────────────────────────────────────────
-    # If SPF passes, legitimate high-link-count notification emails
-    # (GitHub, Jira, AWS) shouldn't be penalized as heavily for link density.
-    # This is a DOWNWARD adjustment applied conceptually — the MLP learns
-    # to use it, we just hand it the raw material.
+    # ── Auth-pass URL discount ────────────────────────────────────────────────
+    # If DMARC passes AND DKIM is aligned, ESP-sent email with many tracking
+    # links should not be penalized for link density.
+    # auth_alignment_score is 0.0 for fully trusted, 1.0 for no auth.
     link_density = url_result["features"].get("link_density_score", 0.0)
-    spf_pass_url_discount = link_density * (0.3 if spf_passed else 1.0)
-    spf_pass_url_discount = round(min(1.0, spf_pass_url_discount), 4)
+    auth_trust   = 1.0 - auth_align_score  # 1.0 = fully trusted
+    spf_pass_url_discount = round(link_density * (1.0 - auth_trust * 0.7), 4)
 
     # ── Multi-signal agreement ────────────────────────────────────────────────
-    # Count how many independent modules score above 0.5 — agreement across
-    # modules is much stronger evidence than any single module firing alone.
     module_scores = [
         domain_result.get("score", 0.0),
         url_result.get("score", 0.0),
@@ -81,16 +75,19 @@ def score_cross_signal(
     domain_mismatch_val = domain_result["features"].get("domain_mismatch", 0.0)
     domain_bdi_agreement = round(
         min(1.0, domain_mismatch_val * mcld_mismatch * 1.5), 4
-    )  # multiplicative — both must fire for this to be high
+    )
 
-    # ── Lexical brand confusion (typosquat + impersonation both firing) ──────
-    mcld_lexical = bdi_result.get("mcld_lexical", {})
+    # ── Lexical brand confusion ───────────────────────────────────────────────
+    mcld_lexical    = bdi_result.get("mcld_lexical", {})
     typosquat_score = mcld_lexical.get("brand_typosquat_score", 0.0)
     brand_imperson  = domain_result["features"].get("brand_impersonation", 0.0)
-    lexical_brand_confusion = round(min(1.0, typosquat_score * 0.6 + brand_imperson * 0.4), 4)
+    lexical_brand_confusion = round(
+        min(1.0, typosquat_score * 0.6 + brand_imperson * 0.4), 4
+    )
 
+    # ── Composite cross-signal score ──────────────────────────────────────────
     score = min(1.0,
-        (1.0 - trust_consistency_score) * 0.20 +   # inverse — low trust raises score
+        (1.0 - trust_consistency_score) * 0.20 +
         spf_pass_url_discount           * 0.15 +
         multi_signal_phish_score        * 0.30 +
         domain_bdi_agreement            * 0.20 +
