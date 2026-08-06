@@ -1,14 +1,11 @@
 """
-phishbyte/model/mlp.py — v8
+phishbyte/model/mlp.py — v9
 
-Changes from v7:
-  - Input dim: 85 → 104 (added lexical sender[6] + lexical mcld[6] +
-    cross_signal[5] + bdi extended[+2] = 19 new features)
-  - Architecture widened: 104→520→260(×2 ResBlock)→130→64→1 (~515K params)
-  - Temperature-scaled sigmoid: learned scalar T divides the logit before
-    sigmoid, so probability outputs are calibrated (not just monotonic).
-    forward() now returns raw logits during training; predict_proba()
-    applies temperature + sigmoid for inference.
+Changes from v8:
+  - Input dim: 104 → 107 (added dmarc_pass, dkim_aligned, auth_alignment_score)
+  - Architecture: 107→620→310(×2 ResBlock)→155→76→1
+  - Parameters: 716,322 → 718,410
+  - Everything else identical to v8
 """
 
 import torch
@@ -25,14 +22,16 @@ _STATIC_FEATURES: List[str] = [
     # URL (5)
     "http_ratio","anchor_mismatch_score","suspicious_tld_score",
     "urgency_score","link_density_score",
-    # SPF (3)
+    # SPF original (3) — backward compatible names
     "spf_fail","no_spf_record","no_sending_ip",
+    # SPF extended — auth alignment (3 NEW)
+    "dmarc_pass","dkim_aligned","auth_alignment_score",
     # Subject (7)
     "subject_urgency","subject_security","subject_brand_name",
     "subject_currency","subject_all_caps","subject_fake_re","subject_fake_txn_id",
     # Char-level (5)
     "caps_ratio","digit_ratio","special_density","avg_word_length","html_text_ratio",
-    # BDI extended (5, was 3)
+    # BDI extended (5)
     "mcld_mismatch","form_action_mismatch","external_link_ratio",
     "form_action_is_ip","redirect_param_present",
     # Lexical — sender domain (6)
@@ -49,9 +48,9 @@ _STATIC_FEATURES: List[str] = [
     "subject_layer_score","bdi_layer_score",
 ]
 
-INPUT_DIM_STATIC = len(_STATIC_FEATURES)   # 54
+INPUT_DIM_STATIC = len(_STATIC_FEATURES)   # 57
 TFIDF_N          = 50
-INPUT_DIM        = INPUT_DIM_STATIC + TFIDF_N  # 104
+INPUT_DIM        = INPUT_DIM_STATIC + TFIDF_N  # 107
 
 HIDDEN_1, HIDDEN_2, HIDDEN_3, HIDDEN_4 = 620, 310, 155, 76
 
@@ -78,30 +77,29 @@ class PhishByteMLPLayer(
     tags=["phishing-detection","email-security","pytorch","from-scratch",
           "no-pretrained-weights","cascading-inference","explainable-ai",
           "cybersecurity","nlp","phishing","cross-signal-fusion",
-          "lexical-analysis","calibrated-probabilities"],
+          "lexical-analysis","calibrated-probabilities","dmarc-alignment"],
 ):
     """
-    PhishByte MLP v8 — 104-feature, ~515K parameter email phishing classifier.
+    PhishByte MLP v9 — 107-feature, ~718K parameter email phishing classifier.
 
-    Architecture: 104 → 520 → 260 (×2 ResBlock) → 130 → 64 → 1
+    Architecture: 107 → 620 → 310 (×2 ResBlock) → 155 → 76 → 1
     Temperature-scaled sigmoid for calibrated probability output.
 
-    New in v8:
-      - Cross-extractor interaction features (trust consistency, multi-signal
-        agreement, domain/BDI compounding) computed after base extractors run
-      - Character-level lexical analysis (digit runs, hyphen runs, entropy,
-        typosquat distance) on both sender domain and most-common-link domain
-      - Extended BDI: form-action-is-IP, open-redirect parameter detection
-      - Learned temperature parameter for calibrated confidence scores
+    New in v9 vs v8:
+      - DMARC pass/fail parsed from Authentication-Results header
+      - DKIM alignment: signing domain root matches From root domain
+      - auth_alignment_score: composite SPF+DKIM+DMARC trust signal
+      - cross_signal trust_consistency now anchored to DMARC not raw SPF
+      - Fixes false positives on ESP-relayed legitimate email (Google/ACM/LinkedIn)
     """
 
     def __init__(
         self,
-        input_dim: int = INPUT_DIM,
-        hidden_1:  int = HIDDEN_1,
-        hidden_2:  int = HIDDEN_2,
-        hidden_3:  int = HIDDEN_3,
-        hidden_4:  int = HIDDEN_4,
+        input_dim: int   = INPUT_DIM,
+        hidden_1:  int   = HIDDEN_1,
+        hidden_2:  int   = HIDDEN_2,
+        hidden_3:  int   = HIDDEN_3,
+        hidden_4:  int   = HIDDEN_4,
         dropout1:  float = 0.3,
         dropout2:  float = 0.2,
         dropout3:  float = 0.1,
@@ -127,19 +125,12 @@ class PhishByteMLPLayer(
             nn.Linear(input_dim, hidden_4), nn.BatchNorm1d(hidden_4),
         )
 
-        # Output head returns a RAW LOGIT (no sigmoid here) —
-        # temperature scaling + sigmoid applied in predict_proba() and
-        # in forward() via self.temperature, so training can use
-        # BCEWithLogitsLoss and calibration is learned end-to-end.
         self.head = nn.Sequential(
             nn.ReLU(), nn.Dropout(0.05),
             nn.Linear(hidden_4, 1),
         )
 
-        # Learned temperature — initialized to 1.0 (no scaling).
-        # T > 1 softens overconfident predictions, T < 1 sharpens them.
-        # This single scalar is fit during a short calibration pass
-        # AFTER main training converges (see calibrate_thresholds.py).
+        # Learned temperature — calibrated post-training via LBFGS
         self.temperature = nn.Parameter(torch.ones(1))
 
         self._init_weights()
@@ -152,17 +143,13 @@ class PhishByteMLPLayer(
                     nn.init.zeros_(m.bias)
 
     def forward_logits(self, x: torch.Tensor) -> torch.Tensor:
-        """Raw logit output, no sigmoid. Used with BCEWithLogitsLoss during training."""
+        """Raw logit — use with BCEWithLogitsLoss during training."""
         main = self.proj(self.res2(self.res1(self.stream(x))))
         return self.head(main + self.skip(x))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Calibrated probability output — divides logit by learned temperature
-        before sigmoid. This is what predict_proba() and inference use.
-        """
-        logits = self.forward_logits(x)
-        return torch.sigmoid(logits / self.temperature.clamp(min=0.05))
+        """Temperature-calibrated probability — use at inference."""
+        return torch.sigmoid(self.forward_logits(x) / self.temperature.clamp(min=0.05))
 
     def predict_proba(self, x: torch.Tensor) -> float:
         self.eval()
@@ -174,7 +161,7 @@ class PhishByteMLPLayer(
     def get_config(self) -> Dict:
         return {
             "model_type":      "PhishByteMLP",
-            "version":         "8.0",
+            "version":         "9.0",
             "input_dim":       self.input_dim,
             "hidden_dims":     [HIDDEN_1, HIDDEN_2, HIDDEN_3, HIDDEN_4],
             "residual_blocks": 2,
@@ -187,14 +174,19 @@ class PhishByteMLPLayer(
 
 
 def build_feature_vector(
-    d_res: Dict, u_res: Dict, s_res: Dict, sub_res: Dict,
-    bdi_res: Dict, cross_res: Dict,
-    sender_lexical: Dict, mcld_lexical: Dict,
+    d_res:          Dict,
+    u_res:          Dict,
+    s_res:          Dict,
+    sub_res:        Dict,
+    bdi_res:        Dict,
+    cross_res:      Dict,
+    sender_lexical: Dict,
+    mcld_lexical:   Dict,
     tfidf_features: Dict[str, float],
 ) -> torch.Tensor:
     """
-    Assemble 104-dimensional feature vector.
-    Order: 54 static features (incl. 12 lexical + 5 cross-signal) + 50 TF-IDF.
+    Assemble 107-dimensional feature vector.
+    Order: 57 static features + 50 TF-IDF.
     """
     d, u, s, sub, bdi, cross = (
         d_res["features"], u_res["features"], s_res["features"],
@@ -202,28 +194,40 @@ def build_feature_vector(
     )
 
     static = [
+        # Domain (7)
         d["domain_mismatch"], d["replyto_differs"], d["returnpath_differs"],
         d["from_is_freemail"], d["brand_impersonation"],
         d["display_name_mismatch"], d["suspicious_domain_pattern"],
+        # URL (5)
         u["http_ratio"], u["anchor_mismatch_score"], u["suspicious_tld_score"],
         u["urgency_score"], u["link_density_score"],
+        # SPF original (3)
         s["spf_fail"], s["no_spf_record"], s["no_sending_ip"],
+        # SPF extended — auth alignment (3 NEW)
+        s["dmarc_pass"], s["dkim_aligned"], s["auth_alignment_score"],
+        # Subject (7)
         sub["subject_urgency"], sub["subject_security"], sub["subject_brand_name"],
         sub["subject_currency"], sub["subject_all_caps"],
         sub["subject_fake_re"], sub["subject_fake_txn_id"],
+        # Char-level (5)
         u["caps_ratio"], u["digit_ratio"], u["special_density"],
         u["avg_word_length"], u["html_text_ratio"],
+        # BDI extended (5)
         bdi["mcld_mismatch"], bdi["form_action_mismatch"], bdi["external_link_ratio"],
         bdi["form_action_is_ip"], bdi["redirect_param_present"],
+        # Lexical — sender domain (6)
         sender_lexical["digit_run_score"], sender_lexical["hyphen_run_score"],
         sender_lexical["entropy_score"], sender_lexical["vowel_ratio_anomaly"],
         sender_lexical["brand_typosquat_score"], sender_lexical["domain_length_score"],
+        # Lexical — most common link domain (6)
         mcld_lexical["digit_run_score"], mcld_lexical["hyphen_run_score"],
         mcld_lexical["entropy_score"], mcld_lexical["vowel_ratio_anomaly"],
         mcld_lexical["brand_typosquat_score"], mcld_lexical["domain_length_score"],
+        # Cross-signal (5)
         cross["trust_consistency_score"], cross["spf_pass_url_discount"],
         cross["multi_signal_phish_score"], cross["domain_bdi_agreement"],
         cross["lexical_brand_confusion"],
+        # Composite scores (5)
         d_res["score"], u_res["score"], s_res["score"],
         sub_res["score"], bdi_res["score"],
     ]
@@ -232,4 +236,5 @@ def build_feature_vector(
     return torch.tensor(static + tfidf_vals, dtype=torch.float32)
 
 
+# Backward compatibility alias
 FEATURE_NAMES = _STATIC_FEATURES
